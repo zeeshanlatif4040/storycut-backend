@@ -106,9 +106,30 @@ def orientation_of(w: int, h: int) -> str:
     return "square"
 
 
+def _is_edge_block(msg: str) -> bool:
+    """Detect a Cloudflare (or similar) edge block.
+
+    Cloudflare answers blocked requests with HTTP 403 and an HTML page
+    containing "error code: 1010" (browser-signature block). The provider API
+    never sees the request, so the API key is NOT the problem — re-entering
+    the key can never fix it.
+    """
+    m = msg.lower()
+    return ("error code: 1010" in m or "error code: 1020" in m
+            or ("cloudflare" in m and "403" in m))
+
+
 def classify_error(msg: str) -> str:
     """Turn a raw provider error into a useful user-facing explanation."""
     m = msg.lower()
+    if _is_edge_block(m):
+        return ("Blocked by the provider's network protection (Cloudflare) — "
+                "the request was stopped before your API key was even checked, "
+                "so this is NOT an API key problem. The app now presents a "
+                "browser fingerprint to get through; press Test again. If it "
+                "still fails, this server's IP is blocked and the provider "
+                "must allowlist it. "
+                f"({msg[:120]})")
     if "429" in m or "rate limit" in m or "too many requests" in m:
         return ("Rate limit reached — the provider is throttling requests. "
                 "Wait a bit; the app backs off and tries the next provider. "

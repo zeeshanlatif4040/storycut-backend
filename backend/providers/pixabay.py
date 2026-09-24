@@ -5,12 +5,9 @@ Only documented endpoints are used.
 """
 from __future__ import annotations
 import time
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
 from .base import (BaseProvider, ProviderMeta, Candidate, orientation_of,
                    pick_1080p, resolution_label)
+from .http import api_get_json, ProviderHttpError
 
 META = ProviderMeta(
     key="pixabay",
@@ -49,20 +46,20 @@ class PixabayProvider(BaseProvider):
             raise RuntimeError("Pixabay API key not configured")
         params = dict(params)
         params["key"] = self.api_key
-        full = url + "?" + urllib.parse.urlencode(params)
         t0 = time.time()
         try:
-            with urllib.request.urlopen(full, timeout=25) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")[:200]
+            # Browser fingerprint (see providers/http.py): Cloudflare blocks
+            # datacenter IPs presenting Python's TLS fingerprint with
+            # HTTP 403 + "error code: 1010" before the key is ever checked.
+            return api_get_json(url, params)
+        except ProviderHttpError as e:
+            body = e.body[:200]
             if e.code == 429:
                 self.cooldown(60)
                 raise RuntimeError(f"Pixabay rate limit hit (HTTP 429). {body}")
             raise RuntimeError(f"Pixabay HTTP {e.code}: {body}")
         finally:
             self.note_call((time.time() - t0) * 1000)
-        return data
 
     # ------------------------------------------------------------- search
     def search(self, query: str, orientation: str = "landscape",

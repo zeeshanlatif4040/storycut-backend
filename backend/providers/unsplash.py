@@ -6,10 +6,7 @@ Only documented endpoints are used. Images only.
 """
 from __future__ import annotations
 import time
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
+from .http import api_get_json, ProviderHttpError
 from .base import (BaseProvider, ProviderMeta, Candidate, orientation_of,
                    resolution_label)
 
@@ -49,16 +46,17 @@ class UnsplashProvider(BaseProvider):
     def _get(self, params: dict) -> dict:
         if not self.api_key:
             raise RuntimeError("Unsplash API key not configured")
-        full = _API + "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(
-            full, headers={"Authorization": f"Client-ID {self.api_key}",
-                           "Accept-Version": "v1"})
         t0 = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")[:200]
+            # Browser fingerprint (see providers/http.py): Cloudflare blocks
+            # datacenter IPs presenting Python's TLS fingerprint with
+            # HTTP 403 + "error code: 1010" before the key is ever checked.
+            return api_get_json(
+                _API, params,
+                headers={"Authorization": f"Client-ID {self.api_key}",
+                         "Accept-Version": "v1"})
+        except ProviderHttpError as e:
+            body = e.body[:200]
             if e.code == 429 or (e.code == 403 and "rate" in body.lower()):
                 self.cooldown(120)
                 raise RuntimeError(f"Unsplash rate limit hit (HTTP {e.code}). {body}")

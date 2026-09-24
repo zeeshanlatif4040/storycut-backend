@@ -2,11 +2,12 @@
 // visual selection (user footage scoring vs. provider B-roll search with
 // fallback) -> timeline assembly -> subtitles/overlays/transitions ->
 // quality control -> review queue -> completion.
-import { post, get, toast, fmtTime, uid } from "./api.js";
+import { post, get, toast, fmtTime, uid, uploadFiles } from "./api.js";
 import { S, tl, markDirty, mutate, scheduleAutosave, saveProject } from "./store.js";
 
 let cancelled = false;
 let lastCfg = null;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export function showProcessing(show) {
   document.getElementById("processing").classList.toggle("hidden", !show);
@@ -28,8 +29,15 @@ function renderSceneCells(segs) {
 function markScene(id, state, label) {
   const el = document.getElementById(`cell-${id}`);
   if (!el) return;
-  el.classList.remove("working"); el.classList.add("done");
-  el.querySelector(".st").textContent = state === "ok" ? "✅" : state === "warn" ? "⚠️" : "❌";
+  const icon = el.querySelector(".st");
+  if (state === "retry") {
+    // regeneration in progress — keep the "working" look, show 🔁
+    el.classList.add("working"); el.classList.remove("done");
+    icon.textContent = "🔁";
+  } else {
+    el.classList.remove("working"); el.classList.add("done");
+    icon.textContent = state === "ok" ? "✅" : state === "warn" ? "⚠️" : "❌";
+  }
   if (label) el.title = label;
 }
 
@@ -234,29 +242,78 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
   const wantBrollFirst = mode === "broll-only" || mode === "broll-first" || mode === "balanced";
   const wantUserFirst = mode === "user-only" || mode === "user-first" || mode === "balanced";
 
+  // Progressively relaxed query rounds: when providers return nothing (or
+  // all fail), the scene is automatically REGENERATED with broader searches
+  // instead of being left empty after the first failure.
+  function relaxedQueries(round) {
+    const kws = (seg.keywords || []).filter(Boolean);
+    if (round === 1) return seg.queries.slice(0, nQueries);
+    if (round === 2) {
+      const out = [];
+      if (kws[0]) out.push(kws[0]);
+      if (kws[1]) out.push(kws[1]);
+      if (kws[0] && kws[2]) out.push(`${kws[0]} ${kws[2]}`);
+      return out.filter((q, i) => q && out.indexOf(q) === i);
+    }
+    // round 3: broadest — most important keyword, then a generic cinematic query
+    const out = [];
+    if (kws[0]) out.push(kws[0]);
+    out.push("cinematic background");
+    return out.filter((q, i) => q && out.indexOf(q) === i);
+  }
+
+  async function downloadWithRetry(cand, query) {
+    let lastErr = null;
+    for (let i = 0; i < 2; i++) {
+      try {
+        const t0 = performance.now();
+        const asset = await downloadCandidate(cand, query);
+        metrics.searchesMs += performance.now() - t0;
+        return asset;
+      } catch (e) { lastErr = e; await sleep(800); }
+    }
+    throw lastErr;
+  }
+
   async function tryBroll() {
     if (mode === "user-only") return null;
-    const queries = seg.queries.slice(0, nQueries);
-    // The AI decides per scene: video first (motion usually wins), but images
-    // compete whenever video is weak or missing — never force video.
-    const v = await searchBroll(queries, orientation, need, usedIds, perPage, metrics, "video");
-    const vScore = v && v.candidates.length ? v.candidates[0].score : 0;
-    let found = v, best = vScore + 0.05; // slight preference for motion
-    if (vScore < 0.45) {
-      const im = await searchBroll(queries, orientation, need, usedIds, perPage, metrics, "image");
-      const iScore = im && im.candidates.length ? im.candidates[0].score : 0;
-      if (iScore > best) { found = im; best = iScore; }
+    for (let round = 1; round <= 3; round++) {
+      if (cancelled) return null;
+      if (round > 1) {
+        markScene(seg.id, "retry",
+          `No match — regenerating with broader search (attempt ${round}/3)…`);
+        await sleep(1200); // gentle backoff; also lets rate-limit cooldowns breathe
+      }
+      const queries = relaxedQueries(round);
+      const pp = Math.min(24, perPage + (round - 1) * 6);
+      // The AI decides per scene: video first (motion usually wins), but images
+      // compete whenever video is weak or missing — never force video.
+      const v = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "video");
+      const vScore = v && v.candidates.length ? v.candidates[0].score : 0;
+      let found = v, best = vScore + 0.05; // slight preference for motion
+      if (vScore < 0.45) {
+        const im = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "image");
+        const iScore = im && im.candidates.length ? im.candidates[0].score : 0;
+        if (iScore > best) { found = im; best = iScore; }
+      }
+      if (!found) continue;
+      try {
+        const cand = found.candidates[0];
+        const asset = await downloadWithRetry(cand, found.query);
+        asset.sourceType = "broll";
+        P.assets[asset.name] = asset;
+        return { asset,
+                 // later rounds = broader match: score honestly so confidence stays truthful
+                 score: Math.max(0.22, cand.score - (round - 1) * 0.08),
+                 provider: found.provider, query: found.query,
+                 match: cand.match, attempts: found.attempts,
+                 mediaType: found.mediaType || cand.media_type || "video" };
+      } catch (e) {
+        metrics.failed++;
+        continue; // download failed — next round tries a fresh query set
+      }
     }
-    if (!found) return null;
-    const cand = found.candidates[0];
-    const t0 = performance.now();
-    const asset = await downloadCandidate(cand, found.query);
-    metrics.searchesMs += performance.now() - t0;
-    asset.sourceType = "broll";
-    P.assets[asset.name] = asset;
-    return { asset, score: cand.score, provider: found.provider, query: found.query,
-             match: cand.match, attempts: found.attempts,
-             mediaType: found.mediaType || cand.media_type || "video" };
+    return null;
   }
   function tryUser() {
     if (!bestUser || mode === "broll-only") return null;
@@ -282,15 +339,46 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
   }
 
   if (!pick) {
-    const clip = gapClip(seg, "no B-roll results and no matching user media");
-    return clip;
+    // No fresh visual after all retry rounds — fall back so the scene is
+    // NEVER left empty: reuse an already-downloaded asset, else generate a
+    // local title slate. A black gap is the absolute last resort only.
+    const fb = fallbackAsset(seg, P, mode, usedIds);
+    if (fb) {
+      return buildClipFromAsset(seg, orientation, need, fb.asset, {
+        score: 0.25, via: fb.via, confidence: "low",
+        reviewReason: fb.reason, title: fb.title,
+        searchQuery: "", matchInfo: { fallback: true },
+      });
+    }
+    try {
+      const asset = await slateAsset(seg, P, orientation);
+      return buildClipFromAsset(seg, orientation, need, asset, {
+        score: 0.2, via: "slate", confidence: "low",
+        reviewReason: "Generated title card — all providers failed after 3 search rounds",
+        title: `🖼️ ${((seg.keywords || []).slice(0, 3).join(" ") || "scene").slice(0, 34)}`,
+        searchQuery: "", matchInfo: { fallback: true, slate: true },
+      });
+    } catch (e) {
+      return gapClip(seg, "no B-roll results and no matching user media");
+    }
   }
 
   const { asset } = pick;
+  return buildClipFromAsset(seg, orientation, need, asset, {
+    score: pick.score, via,
+    reviewReason: undefined, // auto: weak-match note when confidence is low
+    searchQuery: pick.query || "",
+    matchInfo: pick.match || { keyword: round2(bestUser?.overlap || 0) },
+  });
+}
+
+// Build a timeline clip from any asset (fresh pick, reused fallback, or slate).
+function buildClipFromAsset(seg, orientation, need, asset, opts) {
   const { srcStart, srcEnd: sEnd, speed } = pickSrcStart(asset, need);
   const srcEnd = sEnd || (srcStart + need);
-  const confidence = pick.score >= 0.55 ? "high" : pick.score >= 0.32 ? "medium" : "low";
-
+  const score = opts.score ?? 0.3;
+  const confidence = opts.confidence ||
+    (score >= 0.55 ? "high" : score >= 0.32 ? "medium" : "low");
   return {
     clipId: uid("clip"), assetId: asset.name, sourceType: asset.sourceType,
     provider: asset.provider || null, assetIdRaw: asset.assetId || null,
@@ -305,13 +393,88 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
     filter: {},
     transitionIn: { type: "cut", duration: 0 }, transitionOut: { type: "cut", duration: 0 },
     locked: false, confidence,
-    reviewReason: confidence === "low" ? `Weak ${via} match (score ${pick.score.toFixed(2)}) for “${(seg.keywords || []).slice(0, 3).join(" ")}”` : null,
+    reviewReason: opts.reviewReason !== undefined ? opts.reviewReason :
+      (confidence === "low" ? `Weak ${opts.via} match (score ${score.toFixed(2)}) for “${(seg.keywords || []).slice(0, 3).join(" ")}”` : null),
     segmentId: seg.id, intent: (seg.keywords || []).join(" "),
-    searchQuery: pick.query || "",
-    title: via === "broll" ? `🎬 ${(asset.original || "").slice(0, 34)}` : `📁 ${(asset.original || "").slice(0, 34)}`,
+    searchQuery: opts.searchQuery !== undefined ? opts.searchQuery : "",
+    title: opts.title ||
+      (opts.via === "broll" ? `🎬 ${(asset.original || "").slice(0, 34)}` : `📁 ${(asset.original || "").slice(0, 34)}`),
     thumb: asset.thumb || null,
-    matchInfo: pick.match || { keyword: round2(bestUser?.overlap || 0) },
+    matchInfo: opts.matchInfo || null,
   };
+}
+
+// Fallback 1: reuse an already-downloaded asset so the scene is never empty.
+function fallbackAsset(seg, P, mode, usedIds) {
+  const onTimeline = new Set((P.timeline.clips || []).map(c => c.assetId));
+  const pool = Object.values(P.assets || {}).filter(a => {
+    if (!a || !a.name) return false;
+    const st = a.sourceType;
+    if (st !== "broll" && st !== "user_video" && st !== "user_image") return false;
+    if (mode === "broll-only" && st !== "broll") return false;
+    if (mode === "user-only" && st !== "user_video" && st !== "user_image") return false;
+    if (usedIds.includes(`${a.provider || "?"}:${a.assetId || a.name}`)) return false;
+    return true;
+  });
+  // prefer assets not yet placed on the timeline (visual variety)
+  pool.sort((a, b) => (onTimeline.has(a.name) ? 1 : 0) - (onTimeline.has(b.name) ? 1 : 0));
+  if (!pool.length) return null;
+  const a = pool[0];
+  const via = a.sourceType === "broll" ? "broll" : "user";
+  return { asset: a, via,
+    title: `♻️ ${(a.original || a.name || "").slice(0, 34)}`,
+    reason: "Fallback visual reused — no fresh B-roll found after 3 search rounds" };
+}
+
+// Fallback 2: generate a local cinematic title slate (gradient + scene
+// keywords) and upload it as an image asset — a designed card, never black.
+async function slateAsset(seg, P, orientation) {
+  const portrait = orientation === "portrait";
+  const W = portrait ? 720 : 1280, H = portrait ? 1280 : 720;
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const x = cv.getContext("2d");
+  const g = x.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, "#1c2540"); g.addColorStop(1, "#0a0d14");
+  x.fillStyle = g; x.fillRect(0, 0, W, H);
+  const rg = x.createRadialGradient(W / 2, H * 0.36, 10, W / 2, H * 0.36, W * 0.62);
+  rg.addColorStop(0, "rgba(130,150,210,0.22)"); rg.addColorStop(1, "rgba(130,150,210,0)");
+  x.fillStyle = rg; x.fillRect(0, 0, W, H);
+  x.fillStyle = "#e8b34b"; // accent line
+  const lw = Math.min(300, W * 0.32);
+  x.fillRect(W / 2 - lw / 2, H * 0.60, lw, Math.max(3, H * 0.005));
+  x.textAlign = "center";
+  x.fillStyle = "rgba(255,255,255,0.55)";
+  x.font = `600 ${Math.round(H * 0.028)}px system-ui, -apple-system, sans-serif`;
+  x.fillText(`SCENE ${(seg.index ?? 0) + 1}`, W / 2, H * 0.40);
+  const words = ((seg.keywords || []).join(" ") || "story moment").toUpperCase();
+  x.fillStyle = "#f2f4f8";
+  x.font = `700 ${Math.round(H * 0.052)}px system-ui, -apple-system, sans-serif`;
+  wrapLines(x, words, W * 0.8).slice(0, 3)
+    .forEach((ln, i) => x.fillText(ln, W / 2, H * 0.48 + i * H * 0.068));
+  const blob = await new Promise(r => cv.toBlob(r, "image/png"));
+  if (!blob) throw new Error("slate render failed");
+  const file = new File([blob], `slate-${seg.id}.png`, { type: "image/png" });
+  const files = await uploadFiles([file], "media");
+  const meta = files && files[0];
+  if (!meta || !meta.name) throw new Error("slate upload failed");
+  const asset = { ...meta, assetId: meta.name, sourceType: "user_image",
+                  original: file.name, slate: true };
+  P.assets[meta.name] = asset;
+  return asset;
+}
+
+function wrapLines(ctx, text, maxW) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    const t = cur ? cur + " " + w : w;
+    if (ctx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; }
+    else cur = t;
+  }
+  if (cur) lines.push(cur);
+  return lines;
 }
 
 function applyTransitions(P) {
@@ -388,6 +551,7 @@ function showCompletion(P, repairs) {
   const broll = main.filter(c => c.sourceType === "broll").length;
   const user = main.filter(c => c.sourceType === "user_video" || c.sourceType === "user_image").length;
   const gaps = main.filter(c => c.sourceType === "gap").length;
+  const fallbacks = main.filter(c => c.matchInfo && c.matchInfo.fallback).length;
   const m = P.metrics;
   const root = document.getElementById("modal-root");
   root.innerHTML = `
@@ -409,6 +573,7 @@ function showCompletion(P, repairs) {
     ${repairs.length ? `<h4 class="sec">Auto repairs (${repairs.length})</h4>
       <div class="debug-box" style="max-height:120px">${repairs.map(r => "• " + r).join("\n")}</div>` : ""}
     ${gaps ? `<p style="color:var(--warn)">⚠ ${gaps} scene(s) have no visual yet — see the review queue.</p>` : ""}
+    ${fallbacks ? `<p style="color:var(--warn)">♻️ ${fallbacks} scene(s) used fallback visuals (reused clip or generated title card) — review them in the queue.</p>` : ""}
     <div class="modal-foot">
       <button class="btn" id="cp-review">⚠ View low-confidence segments (${P.review.length})</button>
       <button class="btn primary" id="cp-ok">OK — Review video</button>
