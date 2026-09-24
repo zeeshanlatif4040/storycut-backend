@@ -5,6 +5,9 @@ import { runAutoEdit } from "./pipeline.js";
 
 const STEPS = ["Script", "Voice-over", "Media", "Format & Sources", "Review"];
 let wiz = null;
+// Assets imported from Settings while no wizard is open wait here instead
+// of being silently dropped; openWizard() merges them into the new project.
+const pendingImports = [];
 
 export function initStartup() {
   document.getElementById("mode-broll").onclick = () => openWizard("broll");
@@ -12,6 +15,21 @@ export function initStartup() {
   document.getElementById("mode-both").onclick = () => openWizard("both");
   document.getElementById("btn-startup-settings").onclick = () =>
     window.dispatchEvent(new CustomEvent("open-settings"));
+  // Assets imported from manual providers via Settings join the wizard's
+  // media list like any uploaded file (deduplicated by server name).
+  // If no wizard is open yet, they wait in pendingImports so nothing is lost.
+  window.addEventListener("media-imported", (e) => {
+    const a = e.detail;
+    if (!a) return;
+    if (!wiz) {
+      if (!pendingImports.some(m => m.name === a.name)) pendingImports.push(a);
+      toast("File saved — it will appear in your media when you start a project.", "ok");
+      return;
+    }
+    if (!wiz.mediaFiles.some(m => m.name === a.name)) wiz.mediaFiles.push(a);
+    const body = document.querySelector("#wizard-body");
+    if (body) renderMediaChips(body);
+  });
   document.getElementById("btn-open-project").onclick = toggleProjectList;
   document.getElementById("wizard-close").onclick = closeWizard;
   document.getElementById("wizard-back").onclick = () => navStep(-1);
@@ -55,6 +73,14 @@ export function openWizard(mode) {
   wiz = { mode, step: 0, script: "", voiceFiles: [], mediaFiles: [],
           format: "16:9", sourceMode: mode === "broll" ? "broll-first" : mode === "user" ? "user-first" : "balanced",
           speedMode: "balanced" };
+  // Merge any files imported from Settings before the wizard was opened.
+  for (const a of pendingImports) {
+    if (!wiz.mediaFiles.some(m => m.name === a.name)) wiz.mediaFiles.push(a);
+  }
+  if (pendingImports.length) {
+    toast(`${pendingImports.length} imported file(s) added to your media`, "ok");
+    pendingImports.length = 0;
+  }
   document.getElementById("wizard-title").textContent =
     mode === "broll" ? "B-Roll Footage Finder" : mode === "user" ? "Auto Edit My Footage" : "B-Roll + My Footage";
   document.getElementById("wizard").classList.remove("hidden");
@@ -151,8 +177,11 @@ function renderVoice(body) {
       if (statusEl) { statusEl.textContent = t; statusEl.className = "voice-status " + (cls || ""); }
     };
     try {
-      setStatus("⏳ Uploading voice-over…");
-      const metas = await uploadFiles(files.slice(0, 1), "voice");
+      setStatus("⏳ Uploading voice-over… 0%");
+      const up = uploadFiles(files.slice(0, 1), "voice", (frac) => {
+        setStatus(`⏳ Uploading voice-over… ${Math.round(frac * 100)}%`);
+      });
+      const metas = await up;
       setStatus("⚙️ Processing audio…");
       // The backend validated the real audio content; double-check timing here.
       const m = metas[0];
@@ -185,16 +214,59 @@ function renderVoiceChips(body) {
   });
 }
 
+function fmtMB(b) {
+  if (!b && b !== 0) return "";
+  return b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB";
+}
+
 function renderMedia(body) {
   dropZone(body, "video/*,image/*", true, async (files) => {
     if (!files.length) return;
+    // Persistent status bar: unlike the toast, this stays on screen for the
+    // whole upload so a slow video upload never "disappears".
+    let bar = body.querySelector("#media-up-status");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "media-up-status";
+      body.appendChild(bar);
+    }
+    const names = files.map(f => f.name).join(", ");
+    bar.innerHTML = `
+      <div class="up-status">
+        <div class="up-row"><span class="up-label">⏳ Uploading: ${esc(names)}</span>
+          <button class="btn sm" id="up-cancel">Cancel</button></div>
+        <div class="up-track"><div class="up-fill" style="width:0%"></div></div>
+        <div class="up-meta muted">0%</div>
+      </div>`;
+    const fill = bar.querySelector(".up-fill");
+    const meta = bar.querySelector(".up-meta");
+    const label = bar.querySelector(".up-label");
+    let done = false;
+    const up = uploadFiles(files, "media", (frac, loaded, total) => {
+      const pct = Math.round(frac * 100);
+      fill.style.width = pct + "%";
+      meta.textContent = `${pct}% — ${fmtMB(loaded)} of ${fmtMB(total)}`;
+    });
+    bar.querySelector("#up-cancel").onclick = () => up.cancel();
     try {
-      toast(`Uploading ${files.length} file(s)…`);
-      const metas = await uploadFiles(files, "media");
+      const metas = await up;
+      done = true;
       wiz.mediaFiles.push(...metas);
       renderMediaChips(body);
+      label.textContent = `✅ ${metas.length} file(s) uploaded & analyzed`;
+      fill.style.width = "100%";
+      meta.textContent = "";
+      bar.querySelector("#up-cancel").remove();
       toast(`${metas.length} file(s) analyzed`, "ok");
-    } catch (e) { toast("Upload failed: " + e.message, "bad"); }
+      setTimeout(() => { if (done) bar.innerHTML = ""; }, 4000);
+    } catch (e) {
+      label.textContent = `❌ Upload failed — ${e.message}`;
+      meta.innerHTML = `<button class="btn sm primary" id="up-retry">Retry</button>
+        <span class="muted"> — tip: large videos upload faster on Wi-Fi; keep clips under ~200 MB on mobile data.</span>`;
+      bar.querySelector("#up-cancel").remove();
+      const rb = bar.querySelector("#up-retry");
+      if (rb) rb.onclick = () => { bar.innerHTML = ""; body.querySelector("#dz-input").click(); };
+    }
   }, "Videos (MP4/MOV/WebM/MKV) and images (JPG/PNG/WebP)");
   renderMediaChips(body);
 }

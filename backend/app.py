@@ -144,6 +144,18 @@ def index():
     return send_from_directory(FRONTEND, "index.html")
 
 
+@app.get("/favicon.ico")
+def favicon():
+    """Serve the same SVG mark as the inline <link rel=icon>.
+
+    Some browsers still request /favicon.ico even with a data: URI icon;
+    without this route every page load logs a console 404.
+    """
+    svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
+           "<text y='.9em' font-size='90'>\u2702\ufe0f</text></svg>")
+    return app.response_class(svg, mimetype="image/svg+xml")
+
+
 # ------------------------------------------------------------------ uploads
 @app.post("/api/uploads")
 def uploads():
@@ -449,6 +461,124 @@ def broll_download():
     store.log_event("broll_downloaded", provider=asset["provider"],
                     asset=asset["assetId"], ms=round((time.time() - t0) * 1000),
                     bytes=asset["size"])
+    return jsonify({"ok": True, "asset": asset})
+
+
+def _finalize_imported_asset(dest, name, provider, asset_id, media_type,
+                            page_url, license_name, attribution_required,
+                            creator, original_label, search_query=""):
+    """Probe a downloaded file and register it as a b-roll asset dict.
+    Shared by /api/broll/download and /api/broll/import-url."""
+    info = media_lib.probe(dest)
+    if not info or not info.get("width"):
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return None, "the downloaded file is not a valid video/image"
+    thumb = name + ".jpg"
+    th = thumb if media_lib.make_thumbnail(
+        dest, store.safe_join(store.DIRS["uploads"], thumb)) else None
+    is_image = media_type == "image"
+    now = time.strftime("%Y-%m-%d")
+    asset = {
+        "name": name,
+        "original": original_label,
+        "kind": "image" if is_image else "video",
+        "sourceType": "broll",
+        "provider": provider, "assetId": asset_id,
+        "pageUrl": page_url, "previewUrl": None,
+        "creator": creator, "creatorUrl": None,
+        "license": license_name,
+        "attributionRequired": bool(attribution_required),
+        "retrievedAt": now,
+        "searchQuery": search_query,
+        "resolution": "",
+        "mediaType": media_type,
+        "width": info["width"], "height": info["height"],
+        "duration": round(info["duration"], 2),
+        "orientation": ("portrait" if info["height"] > info["width"] * 1.05
+                        else "landscape"),
+        "thumb": th, "scenes": [] if is_image else media_lib.scene_moments(dest)[:20],
+        "size": os.path.getsize(dest),
+    }
+    return asset, ""
+
+
+@app.post("/api/broll/import-url")
+def broll_import_url():
+    """Manual-provider import: the user pastes a direct file URL from a
+    manual provider's site (Mixkit, Coverr, Videvo, Dareful, Freepik).
+
+    There is deliberately no automated search here — those sites offer no
+    verified public search API. The URL host must belong to the provider's
+    own domain (anti open-proxy), the file is validated with ffprobe, and
+    the provider's real license metadata is attached. Nothing is faked:
+    if the URL is not from the provider's site, or the file is not real
+    media, the import is rejected with a clear error."""
+    from urllib.parse import urlparse
+    data = request.json or {}
+    provider = str(data.get("provider", "")).strip()
+    file_url = str(data.get("url", "")).strip()
+    media_type = str(data.get("media_type", "video")).strip().lower()
+    try:
+        meta = registry.get_meta(provider)
+    except KeyError:
+        return err(f"unknown provider '{provider}'", 400)
+    if meta.category != "manual":
+        return err("import-url is only for manual providers", 400)
+    if media_type not in (meta.media_types or ["video"]):
+        return err(f"{meta.name} import supports: {', '.join(meta.media_types)}", 400)
+    if not file_url.startswith("https://"):
+        return err("URL must start with https://", 400)
+    host = (urlparse(file_url).hostname or "").lower()
+    allowed = tuple(meta.cdn_hosts or ())
+    if not allowed or not any(host == a or host.endswith("." + a) for a in allowed):
+        return err(
+            f"URL host '{host}' is not on {meta.name}'s own site "
+            f"({', '.join(allowed)}). Paste a direct file link from the "
+            f"{meta.name} page itself.", 400)
+    low = file_url.lower().split("?")[0]
+    if media_type == "image":
+        ext = ".png" if low.endswith(".png") else ".jpg"
+    else:
+        ext = ".mp4" if low.endswith(".mp4") else (".webm" if low.endswith(".webm") else ".mp4")
+    name = store.new_id("br") + ext
+    dest = store.safe_join(store.DIRS["uploads"], name)
+    t0 = time.time()
+    # 400 MB cap: a manual import must never become an open download proxy.
+    max_bytes = 400 * 1024 * 1024
+    try:
+        req = urllib.request.Request(file_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            total = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("file larger than 400 MB — download manually instead")
+                    f.write(chunk)
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return err(f"download failed: {str(e)[:200]}", 502)
+    asset_id = "manual-" + name.rsplit(".", 1)[0]
+    asset, aerr = _finalize_imported_asset(
+        dest, name, provider, asset_id, media_type,
+        page_url=meta.signup_url, license_name=meta.license_name,
+        attribution_required=meta.attribution_required,
+        creator=f"Manual import ({meta.name})",
+        original_label=f"{provider}_manual{ext}",
+        search_query="manual import")
+    if asset is None:
+        return err(aerr, 422)
+    store.log_event("broll_imported", provider=provider, asset=asset_id,
+                    ms=round((time.time() - t0) * 1000), bytes=asset["size"])
     return jsonify({"ok": True, "asset": asset})
 
 

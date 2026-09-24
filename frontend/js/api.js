@@ -41,19 +41,44 @@ export const get = (p) => api(p);
 export const post = (p, body) =>
   api(p, { method: "POST", headers: { "Content-Type": "application/json" },
            body: JSON.stringify(body || {}) });
-export async function uploadFiles(files, kind = "media") {
-  const fd = new FormData();
-  for (const f of files) fd.append("files", f);
-  fd.append("kind", kind);
-  let res;
-  try {
-    res = await fetch(u("/api/uploads"), { method: "POST", body: fd });
-  } catch {
-    throw unreachable();
-  }
-  const data = await readJson(res);
-  if (!res.ok || data.ok === false) throw new Error(data.error || "upload failed");
-  return data.files;
+/** Upload files with a real progress callback.
+ *  Uses XMLHttpRequest because fetch() cannot report upload progress.
+ *  onProgress(frac, loadedBytes, totalBytes) — frac is 0..1.
+ *  The returned promise has a .cancel() method (aborts the upload).
+ *  Network failures report "connection lost" instead of the generic
+ *  backend-unreachable message, which would be misleading mid-upload. */
+export function uploadFiles(files, kind = "media", onProgress) {
+  let xhr;
+  const p = new Promise((resolve, reject) => {
+    const fd = new FormData();
+    for (const f of files) fd.append("files", f);
+    fd.append("kind", kind);
+    xhr = new XMLHttpRequest();
+    xhr.open("POST", u("/api/uploads"));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        try { onProgress(e.loaded / e.total, e.loaded, e.total); } catch {}
+      }
+    };
+    xhr.onload = () => {
+      const ct = (xhr.getResponseHeader("content-type") || "").toLowerCase();
+      if (ct.includes("text/html")) { reject(unreachable()); return; }
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); }
+      catch { reject(unreachable()); return; }
+      if (xhr.status < 200 || xhr.status >= 300 || !data || data.ok === false) {
+        reject(new Error((data && data.error) || `upload failed (HTTP ${xhr.status})`));
+        return;
+      }
+      resolve(data.files);
+    };
+    xhr.onerror = () => reject(new Error(
+      "connection lost during upload — check your internet and try again"));
+    xhr.onabort = () => reject(new Error("upload cancelled"));
+    xhr.send(fd);
+  });
+  p.cancel = () => { try { xhr.abort(); } catch {} };
+  return p;
 }
 export const mediaUrl = (name) => u(`/api/media/file?name=${encodeURIComponent(name)}`);
 export const thumbUrl = (name) => name ? u(`/api/media/thumb?name=${encodeURIComponent(name)}`) : "";

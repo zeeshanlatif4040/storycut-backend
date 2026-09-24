@@ -110,6 +110,15 @@ input[type=range]{accent-color:var(--acc)}
 .file-chip{background:var(--bg4);border:1px solid var(--line2);border-radius:20px;
   padding:6px 13px;font-size:12.5px;display:flex;gap:8px;align-items:center}
 .file-chip button{background:none;border:none;color:var(--muted);cursor:pointer}
+/* Persistent upload progress (stays visible until the upload finishes) */
+.up-status{background:var(--bg4);border:1px solid var(--line2);border-radius:12px;
+  padding:10px 14px;margin-top:12px}
+.up-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.up-label{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.up-track{height:8px;border-radius:6px;background:rgba(255,255,255,.07);overflow:hidden}
+.up-fill{height:100%;width:0%;border-radius:6px;background:linear-gradient(90deg,var(--acc),#8f7bff);
+  transition:width .2s}
+.up-meta{font-size:12px;margin-top:6px}
 .file-chip button:hover{color:var(--bad)}
 .seg-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
 .seg-card{background:var(--bg3);border:2px solid var(--line);border-radius:14px;padding:16px;cursor:pointer;text-align:left;transition:.14s}

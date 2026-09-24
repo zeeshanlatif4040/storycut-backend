@@ -560,7 +560,8 @@ async function openSettings() {
           <button class="btn sm" data-act="test">Test</button>
           ${c.has_key ? `<button class="btn sm" data-act="disc">Disconnect</button>` : ""}
         </div>` : `<div class="pc-note">✅ No key needed — works out of the box.</div>
-        <div class="key-row"><button class="btn sm" data-act="test">Test connection</button></div>`}
+        <div class="key-row"><button class="btn sm" data-act="test">Test connection</button>
+          <button class="btn sm primary" data-act="save">Save settings</button></div>`}
         <div class="pc-grid">
           <div><label class="muted">Priority (lower = tried first)</label><br>
             <input type="number" data-f="priority" value="${c.priority ?? 50}" style="width:80px"></div>
@@ -600,7 +601,11 @@ async function openSettings() {
       const readKey = () => card.querySelector('[data-f="key"]')
         ? card.querySelector('[data-f="key"]').value.trim() : "";
 
-      card.querySelector('[data-act="save"]').onclick = async () => {
+      // NOTE: keyless providers (Wikimedia/Openverse) render a "Save settings"
+      // button instead of a "Save key" button — guard for null so the whole
+      // settings modal never crashes with "Cannot set properties of null".
+      const saveBtn = card.querySelector('[data-act="save"]');
+      if (saveBtn) saveBtn.onclick = async () => {
         const key = readKey();
         try {
           await post(`/api/settings/providers/${p.key}`, {
@@ -669,9 +674,36 @@ async function openSettings() {
             <div><a href="${esc(p.license_url)}" target="_blank" style="color:var(--acc)">${esc(p.license_name)} ↗</a>
             ${p.attribution_required ? " · ⚠️ attribution required" : ""}</div></div>
           ${p.commercial_use ? `<div><label class="muted">Commercial use</label><div>${esc(p.commercial_use)}</div></div>` : ""}
-          <div class="full"><a href="${esc(p.docs_url)}" target="_blank" style="color:var(--acc)">Official site / terms ↗</a></div>
-        </div>`;
+          <div class="full"><a href="${esc(p.docs_url)}" target="_blank" style="color:var(--acc)">Official site / terms ↗</a>
+            · <a href="${esc(p.signup_url)}" target="_blank" style="color:var(--acc)">Open ${esc(p.name)} ↗</a></div>
+        </div>
+        <details class="pc-testsearch"><summary>📥 Import a file link from ${esc(p.name)}</summary>
+          <div class="key-row" style="margin-top:8px">
+            <input type="url" data-f="impurl" style="flex:1" placeholder="Paste direct file link (https://…) from a ${esc(p.name)} page">
+            ${p.media_types.length > 1
+              ? `<select data-f="impmt"><option value="video">Video</option><option value="image">Image</option></select>`
+              : ""}
+            <button class="btn sm primary" data-act="impgo">Import</button>
+          </div>
+          <div class="pc-note muted" data-f="impmsg">No search API here — open the site, copy the direct file link, paste it above. Only ${esc(p.name)}'s own site links are accepted; the file is validated before import.</div>
+        </details>`;
       manBox.appendChild(card);
+      const impMsg = card.querySelector('[data-f="impmsg"]');
+      card.querySelector('[data-act="impgo"]').onclick = async () => {
+        const url = card.querySelector('[data-f="impurl"]').value.trim();
+        const mtEl = card.querySelector('[data-f="impmt"]');
+        const mt = mtEl ? mtEl.value : p.media_types[0];
+        if (!url) { impMsg.textContent = "Paste a file link first."; return; }
+        impMsg.textContent = "⏳ Downloading & validating…";
+        try {
+          const r = await post("/api/broll/import-url", { provider: p.key, url, media_type: mt });
+          impMsg.textContent = `✅ Imported: ${r.asset.original} (${r.asset.width}×${r.asset.height}${r.asset.duration ? ", " + r.asset.duration + "s" : ""}) — added to your media.`;
+          toast(`${p.name} file imported ✓`, "ok");
+          // Hand the asset to the wizard's media list so it can be used
+          // in "Auto Edit My Footage" like any uploaded file.
+          window.dispatchEvent(new CustomEvent("media-imported", { detail: r.asset }));
+        } catch (e) { impMsg.textContent = "❌ Import failed: " + e.message; }
+      };
     }
   } catch (e) { box.innerHTML = `<p style="color:var(--bad)">${esc(e.message)}</p>`; }
 }

@@ -21,13 +21,14 @@ _MANUAL = [
         attribution_required=False,
         quota_notes="No public API offered; manual download only. Mixkit's own terms forbid automated/bot downloading.",
         verified_working=False,
-        status_note="Manual/Future: Mixkit offers free downloads but no "
-                    "public search API, and its terms prohibit script/bot "
-                    "mass-downloading. Download manually in your browser, "
-                    "then use the 'Auto Edit My Footage' workflow.",
+        status_note="Manual: Mixkit offers free downloads but no "
+                    "public search API. Paste a direct file link from a "
+                    "Mixkit page below, or download manually in your "
+                    "browser and use 'Auto Edit My Footage'.",
         media_types=["video"], category="manual", auth_type="none",
         commercial_use="Yes — Mixkit License (see license page).",
         icon="🎞️",
+        cdn_hosts=("mixkit.co",),
     ),
     ProviderMeta(
         key="coverr", name="Coverr", needs_api_key=False,
@@ -36,14 +37,15 @@ _MANUAL = [
         attribution_required=False,
         quota_notes="Coverr's official API is non-commercial use only (per its docs). Not wired in this build.",
         verified_working=False,
-        status_note="Manual/Future: Coverr offers an official API, but it "
+        status_note="Manual: Coverr offers an official API, but it "
                     "permits non-commercial use only and requires a clickable "
                     "Coverr logo credit — so it is not wired into this "
-                    "commercial-capable editor. Download manually in your "
-                    "browser, then use 'Auto Edit My Footage'.",
+                    "commercial-capable editor. Paste a direct file link "
+                    "below, or download manually in your browser.",
         media_types=["video"], category="manual", auth_type="none",
         commercial_use="Yes — Coverr License (see license page).",
         icon="🎥",
+        cdn_hosts=("coverr.co",),
     ),
     ProviderMeta(
         key="videvo", name="Videvo", needs_api_key=False,
@@ -54,11 +56,13 @@ _MANUAL = [
         attribution_required=True,
         quota_notes="No verified public search API; manual download only.",
         verified_working=False,
-        status_note="Manual/Future: no verified public search API. License "
-                    "varies per clip — check the clip page before use.",
+        status_note="Manual: no verified public search API. License "
+                    "varies per clip — check the clip page before use. "
+                    "Paste a direct file link below to import it.",
         media_types=["video"], category="manual", auth_type="none",
         commercial_use="Varies per clip — check the clip page.",
         icon="📹",
+        cdn_hosts=("videvo.net",),
     ),
     ProviderMeta(
         key="dareful", name="Dareful", needs_api_key=False,
@@ -67,11 +71,12 @@ _MANUAL = [
         attribution_required=False,
         quota_notes="No public API offered; manual download only.",
         verified_working=False,
-        status_note="Manual/Future: free 4K downloads but no public search "
-                    "API. Download manually, then use 'Auto Edit My Footage'.",
+        status_note="Manual: free 4K downloads but no public search "
+                    "API. Paste a direct file link below to import it.",
         media_types=["video"], category="manual", auth_type="none",
         commercial_use="Yes — Dareful License (see site).",
         icon="⛰️",
+        cdn_hosts=("dareful.com",),
     ),
     ProviderMeta(
         key="freepik", name="Freepik", needs_api_key=False,
@@ -81,14 +86,15 @@ _MANUAL = [
         attribution_required=True,
         quota_notes="Freepik's stock-content API is usage-based paid, and its license forbids including content in a stock library for redistribution.",
         verified_working=False,
-        status_note="Manual/Future: Freepik's API has no confirmed free tier "
-                    "for automated retrieval, and its license forbids "
-                    "stock-library redistribution — a bad fit for a B-roll "
-                    "app. Not wired in this build.",
+        status_note="Manual: Freepik's API has no confirmed free tier "
+                    "for automated retrieval. Paste a direct file link "
+                    "below to import it, with attribution as their "
+                    "license requires.",
         media_types=["video", "image"], category="manual", auth_type="none",
         commercial_use="Free license allows commercial use WITH attribution "
                        "(see Freepik terms).",
         icon="🖼️",
+        cdn_hosts=("freepik.com",),
     ),
 ]
 
@@ -111,6 +117,17 @@ def get_adapter(key: str, api_key: str = ""):
         cls, _ = _IMPLEMENTED[key]
         return cls(api_key)
     raise RuntimeError(f"Provider '{key}' has no implemented adapter in this build")
+
+
+def get_meta(key: str):
+    """Meta for any known provider (API or manual). Raises KeyError if unknown."""
+    for _, m in _IMPLEMENTED.values():
+        if m.key == key:
+            return m
+    for m in _MANUAL:
+        if m.key == key:
+            return m
+    raise KeyError(f"Unknown provider '{key}'")
 
 
 def implemented_keys() -> list[str]:

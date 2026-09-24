@@ -292,7 +292,7 @@ def _run(job_id: str, timeline: dict, settings: dict):
             ii = len(inputs)
             inputs.append(["-f", "lavfi", "-i",
                            f"color=c=black:s={W}x{H}:r={fps}:d={dur:.3f}"])
-            filters.append(f"[{ii}:v]trim=duration={dur:.3f},setpts=PTS-STARTPTS,"
+            filters.append(f"[{ii}:v]fps={fps},trim=duration={dur:.3f},setpts=PTS-STARTPTS,"
                            f"format=yuv420p[cv{i}]")
             labels.append((f"cv{i}", clip))
             continue
@@ -316,6 +316,11 @@ def _run(job_id: str, timeline: dict, settings: dict):
         ttype = tr.get("type", "cut")
         td = min(float(tr.get("duration", 0.5)), acc_dur / 2, dur / 2)
         aN, bN, nxt = f"an{i}", f"bn{i}", f"acc{i}"
+        # xfade/concat need identical CFR + pix fmt + timebase on both inputs.
+        # Re-assert fps/format here: upstream chains (image loop/zoompan,
+        # lavfi slugs, odd source files) can otherwise hand xfade a 1/0 or
+        # VFR stream, which fails filter config with "must be constant
+        # frame rate". fps/format are idempotent, so double-apply is safe.
         filters.append(f"[{acc}]settb=AVTB[{aN}];[{lab}]settb=AVTB[{bN}]")
         if ttype == "dissolve" and td > 0.05:
             filters.append(

@@ -501,7 +501,10 @@ async function init() {
     b.title = "Scene locks, style profiles & quality check";
     b.textContent = "✂️ Editing";
     const exp = document.getElementById("btn-export");
-    bar.insertBefore(b, exp);
+    // exp lives inside .tb-right, not directly under #topbar, so use
+    // .before() (sibling insert) instead of bar.insertBefore which throws
+    // when the reference node isn't a direct child.
+    if (exp && exp.parentNode) exp.before(b); else bar.appendChild(b);
     b.onclick = () => toggleDrawer();
   }
   window.addEventListener("project-opened", refresh);
