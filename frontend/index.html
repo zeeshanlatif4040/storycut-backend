@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zeeshan AI Workflow — AI B-Roll Finder & Auto Editor</title>
+<link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+
+<!-- ============ STARTUP ============ -->
+<div id="startup" class="overlay">
+  <div class="startup-inner">
+    <div class="brand"><span class="logo">✂</span><h1>Zeeshan AI Workflow</h1>
+      <p>AI B-Roll Finder + Automatic Video Editor</p></div>
+    <div class="mode-cards">
+      <button class="mode-card" id="mode-broll">
+        <div class="mode-icon">🎬</div>
+        <h2>Automatic B-Roll Footage Finder</h2>
+        <p>Script + voice-over in, fully timed B-roll timeline out. Searches free licensed footage for every scene.</p>
+      </button>
+      <button class="mode-card" id="mode-user">
+        <div class="mode-icon">📁</div>
+        <h2>Auto Edit My Footage</h2>
+        <p>Upload your own videos & images. AI picks the best moments, trims and syncs them to your voice-over.</p>
+      </button>
+    </div>
+    <div class="startup-row">
+      <button class="btn primary big" id="mode-both">⚡ Use Both — B-Roll + My Footage</button>
+    </div>
+    <div class="startup-row sub">
+      <button class="link" id="btn-open-project">Open saved project</button>
+      <button class="link" id="btn-startup-settings">B-Roll sources & API settings</button>
+    </div>
+    <div id="project-list" class="project-list hidden"></div>
+  </div>
+</div>
+
+<!-- ============ WIZARD ============ -->
+<div id="wizard" class="overlay hidden">
+  <div class="wizard-box">
+    <div class="wizard-head">
+      <h2 id="wizard-title">New project</h2>
+      <div class="steps" id="wizard-steps"></div>
+      <button class="icon-btn" id="wizard-close" title="Close">✕</button>
+    </div>
+    <div class="wizard-body" id="wizard-body"></div>
+    <div class="wizard-foot">
+      <button class="btn" id="wizard-back">← Back</button>
+      <span class="wizard-hint" id="wizard-hint"></span>
+      <button class="btn primary" id="wizard-next">Next →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ EDITOR ============ -->
+<div id="app" class="hidden">
+  <header id="topbar">
+    <div class="tb-left">
+      <span class="logo small">✂</span>
+      <span class="site-name">Zeeshan <b>AI Workflow</b></span>
+      <input id="project-name" value="Untitled project" spellcheck="false">
+      <span id="save-state" class="save-state"></span>
+    </div>
+    <div class="tb-center">
+      <button class="btn sm" id="btn-undo" title="Undo (Ctrl+Z)">↩</button>
+      <button class="btn sm" id="btn-redo" title="Redo (Ctrl+Y)">↪</button>
+      <span class="tb-sep"></span>
+      <button class="btn sm" id="btn-review" title="Needs review">⚠ Review <b id="review-count">0</b></button>
+      <button class="btn sm" id="btn-script-panel" title="Script sync panel">📜 Script</button>
+      <button class="btn sm" id="btn-debug" title="Debug / developer panel">🐞</button>
+    </div>
+    <div class="tb-right">
+      <button class="btn sm" id="btn-settings">⚙ Sources</button>
+      <button class="btn sm" id="btn-new">＋ New</button>
+      <button class="btn primary sm" id="btn-export">⤓ Export</button>
+    </div>
+  </header>
+
+  <div id="workarea">
+    <aside id="leftpanel">
+      <div class="lp-tabs" id="lp-tabs">
+        <button data-tab="media" class="active">Media</button>
+        <button data-tab="audio">Audio</button>
+        <button data-tab="text">Text</button>
+        <button data-tab="captions">Captions</button>
+        <button data-tab="effects">Effects</button>
+      </div>
+      <div class="lp-body" id="lp-body"></div>
+    </aside>
+
+    <section id="center">
+      <div id="preview-wrap">
+        <canvas id="preview"></canvas>
+        <div id="inspect-badge" class="hidden"></div>
+        <div id="preview-empty">Run the automatic edit or add clips to see a live preview.</div>
+      </div>
+      <div id="transport">
+        <button class="tbtn" id="t-play" title="Play/Pause (Space)">▶</button>
+        <button class="tbtn" id="t-back" title="-5s">⏮</button>
+        <button class="tbtn" id="t-fwd" title="+5s">⏭</button>
+        <span id="t-time">0:00.0 / 0:00.0</span>
+        <input type="range" id="t-scrub" min="0" max="1000" value="0">
+        <button class="tbtn" id="t-mute" title="Mute">🔊</button>
+        <input type="range" id="t-vol" min="0" max="100" value="90" title="Volume">
+        <button class="tbtn" id="t-full" title="Fullscreen">⛶</button>
+        <label class="inspect-toggle"><input type="checkbox" id="inspect-mode"> Inspect</label>
+      </div>
+      <div id="scriptbar" class="hidden">
+        <div id="scriptbar-text"></div>
+      </div>
+    </section>
+
+    <aside id="rightpanel">
+      <h3>Inspector</h3>
+      <div id="inspector-body"><p class="muted">Select a clip on the timeline.</p></div>
+    </aside>
+  </div>
+
+  <div id="timeline-zone">
+    <div id="tl-toolbar">
+      <button class="btn sm" id="tl-split" title="Split at playhead (S)">✂ Split</button>
+      <button class="btn sm" id="tl-dup" title="Duplicate">⧉</button>
+      <button class="btn sm" id="tl-del" title="Delete (Del)">🗑</button>
+      <button class="btn sm" id="tl-lock" title="Lock / unlock">🔓</button>
+      <span class="tl-sep"></span>
+      <label>Zoom <input type="range" id="tl-zoom" min="10" max="400" value="60"></label>
+      <button class="btn sm" id="tl-fit" title="Fit timeline">Fit</button>
+      <span class="tl-sep"></span>
+      <label class="snap-toggle"><input type="checkbox" id="tl-snap" checked> Snap</label>
+      <span id="tl-duration" class="muted"></span>
+    </div>
+    <div id="timeline-scroll">
+      <div id="timeline">
+        <div id="tl-ruler"></div>
+        <div id="tl-tracks"></div>
+        <div id="tl-playhead"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ PROCESSING OVERLAY ============ -->
+<div id="processing" class="overlay hidden">
+  <div class="proc-box">
+    <h2 id="proc-title">Automatic editing…</h2>
+    <div class="proc-bar"><div id="proc-fill"></div></div>
+    <div id="proc-step" class="proc-step">Starting…</div>
+    <div id="proc-scenes" class="proc-scenes"></div>
+    <div class="proc-foot">
+      <span id="proc-stats" class="muted"></span>
+      <button class="btn sm" id="proc-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SETTINGS ============ -->
+<div id="settings" class="overlay hidden">
+  <div class="settings-box">
+    <div class="settings-head">
+      <h2>B-Roll Sources & API Settings</h2>
+      <button class="icon-btn" id="settings-close">✕</button>
+    </div>
+    <p class="muted">Keys are stored server-side on this machine and never shown in full. No paid API is required — Pexels and Pixabay both offer free keys.</p>
+    <div id="provider-cards"></div>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+
+<script src="static/js/config.js"></script>
+<script src="static/js/director.js"></script>
+<script type="module" src="static/js/app.js"></script>
+<script type="module" src="static/js/editing.js"></script>
+<script type="module" src="static/js/studio.js"></script>
+<script>window.addEventListener('DOMContentLoaded', function(){ if (window.EditingUI && window.EditingUI.init) window.EditingUI.init(); });</script>
+</body>
+</html>
