@@ -1,0 +1,183 @@
+WIRING — Creative Director (2 lines to add manually)
+
+1) backend/app.py — add the import with the other local imports (near the
+   top, next to "from . import analysis, store, ..."):
+
+       from . import director_routes
+
+   ...and register the route after the Flask app is created (e.g. right
+   after the CORS setup, before the first @app route):
+
+       director_routes.register_director(app)
+
+2) frontend/index.html — load the UI module before app.js (line ~173):
+
+       <script src="static/js/director.js"></script>
+
+   (Place it right after the config.js script tag; director.js is a classic
+   script that exposes window.DirectorUI, so it must load before the
+   type="module" app.js.)
+
+After wiring, POST /api/director/analyze accepts
+  {"script": "...", "sentences": [{"text","start","end"}, ...]}
+and returns {"ok": true, "storyMap": {...}, "method": "rule-based"}.
+Render with: DirectorUI.renderStoryMap(resp.storyMap, containerEl).
+
+Notes:
+- All director outputs are rule-based/deterministic; the UI labels them so.
+- Nothing else was modified: app.py, panels.js and index.html are untouched.
+
+=====================================================================
+WIRING — AudioFX + Studio (audio intelligence, overlays, debug, autosave)
+=====================================================================
+
+New files (no existing file was modified):
+  backend/audiofx.py          real FFmpeg audio analysis/enhancement
+  backend/audiofx_routes.py   register_audiofx(app)
+  backend/metrics.py          record_stage()/timed()/register_metrics(app)
+  frontend/js/studio.js       window.StudioUI (ES module, auto-inits)
+
+1) backend/app.py — add to the import block (with the other local imports):
+
+       from . import audiofx_routes
+       from .metrics import register_metrics
+
+   ...and register AFTER the Flask app is created (e.g. right after the
+   /api/health route, before `def main()`):
+
+       audiofx_routes.register_audiofx(app)
+       register_metrics(app)
+
+   Resulting routes:
+     POST /api/audiofx/analyze   {"name": "<upload id>"} -> analysis + rhythm hints
+     POST /api/audiofx/enhance   {"name","normalize","denoise","dynamic","target_lufs"}
+                                 -> enhanced .wav asset + before/after report
+     GET  /api/metrics/stages    in-memory stage timings (record_stage)
+
+   NOTE: /api/metrics ALREADY EXISTS in app.py (disk event log) — the new
+   timings endpoint is deliberately /api/metrics/stages to avoid a route
+   conflict. The Studio perf dashboard reads the existing /api/metrics
+   event log (search, search_cache_hit, search_failed, voice_analyzed,
+   export_done, broll_downloaded, audiofx_analyzed, audiofx_enhanced), so
+   the dashboard works with zero app.py changes beyond the two lines above.
+
+2) frontend/index.html — load the studio module with the other scripts:
+
+       <script type="module" src="static/js/studio.js"></script>
+
+   studio.js is an ES module; it auto-initializes on DOMContentLoaded,
+   builds its own floating "🎬 Studio" panel (Overlays / Audio FX / Debug /
+   Perf / Versions tabs), and needs no index.html structure changes.
+
+3) Optional (NOT done — app.py is frozen for this task): wrap expensive
+   calls with the `timed` context manager to add more stage timings, e.g.
+
+       from .metrics import timed
+       with timed("voice_analyze"):
+           duration, intervals = analysis.detect_speech_intervals(path)
+
+   The dashboard already shows voice_analyzed.elapsed from the event log,
+   so this only moves the same number to /api/metrics/stages.
+
+4) Rebuild storycut-netlify.zip after wiring so static/js/studio.js ships.
+
+Test evidence (real FFmpeg, 2026-09-24):
+- analyze on 5s tone+silence+tone: duration 5.0, peak -12.96 dB,
+  RMS -16.94 dB, silence [2.0,3.0]s detected, integrated -16.81 LUFS.
+- clipped file: peak -0.0 dB -> clipping=true.
+- enhance (afftdn + two-pass loudnorm): -16.81 -> -16.04 LUFS (target -16).
+- rhythm_hints: onset at t=3.0s (tone restart after silence) — labeled
+  energy-based, not beat tracking.
+- routes via Flask test_client: analyze 200, enhance 200 (asset
+  afx_*.wav, kind audio), empty-opts 400, missing file 404,
+  /api/metrics/stages 200 with audiofx_* stages + counters.
+- node --check passed on all 11 frontend JS files.
+
+=====================================================================
+WIRING — Editing Controls (locking, source modes, creative modes,
+style profiles, QC, completion report)
+=====================================================================
+
+New files (no existing file was modified):
+  backend/editing.py          pure logic: locks, filter_sources,
+                              CREATIVE_MODES, STYLE_PROFILES (11),
+                              run_qc, auto_fix, build_report
+  backend/editing_routes.py   register_editing(app)
+  frontend/js/editing.js      window.EditingUI (ES module, init on demand)
+
+## 1. backend/app.py — register the editing API (2 insertions)
+
+a) With the other imports (after line 19):
+
+    from . import editing_routes
+
+   (Line 19 is: from . import analysis, store, media as media_lib, export as export_mod
+    Add the new import directly below it.)
+
+b) After ALL route definitions, just before `def main():` (end of file):
+
+    editing_routes.register_editing(app)
+
+   Mounted routes (all JSON, never crash):
+     POST /api/editing/lock      {project_id, scene_idx, locked} -> lock map
+     GET  /api/editing/locks?project_id=...
+     POST /api/editing/qc        {project} -> findings + counts
+                                   (missing files checked against storage/uploads)
+     POST /api/editing/fix       {project, finding_id} -> fixed project + findings
+     POST /api/editing/apply     {project, creative_mode, profile}
+                                   -> trimmed overlays + stamped transitions
+     POST /api/editing/report    {project} -> completion report
+     GET  /api/editing/profiles  (11 style profiles + descriptions)
+     GET  /api/editing/modes     (6 source modes + 3 creative modes)
+
+## 2. frontend/index.html — load the module (1 insertion)
+
+   After the app.js script tag:
+
+    <script type="module" src="static/js/editing.js"></script>
+
+   editing.js injects its own "✂️ Editing" toolbar button + right drawer at
+   runtime; no other file needs edits.
+
+## 3. Start the UI (call once after app boot)
+
+    EditingUI.init()
+
+   Safe to call once (no-ops on repeat). If the backend is unreachable the
+   drawer still opens with an honest notice instead of fake data.
+
+## Notes — PROFILE CONTRACT (how profile params are really consumed)
+
+backend/editing.py documents the contract; the real effects are:
+  pacing_target   -> target seconds/scene when grouping sentences (plan builder)
+  music_energy    -> bed-music ducking/selection energy at export (0..1)
+  text_style      -> drawtext preset family: lower-third/caption/bold-title/minimal/kinetic
+  transition_bias -> default transition stamped on segments lacking one
+apply_editing_settings() already stamps transitions and trims overlays per
+text_density (low: ≤1 overlay per 2 scenes, preferring date/stat; medium: ≤1
+per scene; high: keep all). window.EditingUI.getSettings() exposes the user's
+{sourceMode, creativeMode, profile} to the pipeline, and per-scene footage
+ordering can use filter_sources(candidates, user_media, mode) with the
+selected source mode. Scene locks set clip.locked, which the existing
+regenerateClip() already refuses to touch.
+
+## Test evidence (2026-09-24, real code paths)
+
+- lock_scene/is_locked round-trip; unknown mode raises ValueError.
+- filter_sources verified for all 6 modes (USER_ONLY, BROLL_ONLY,
+  USER_FIRST, BROLL_FIRST, BALANCED interleave, AI_DIRECTOR score sort).
+- run_qc on synthetic project detected: missing file (real os.path.exists),
+  subtitle overlap (0.5s), portrait-in-16:9 aspect mismatch, 3.5s dead
+  silence, adjacent duplicate footage, low confidence (0.3). Finding IDs
+  deterministic across runs.
+- auto_fix: overlap clamped (5.5s -> 5.0s), duplicate swapped to alternate
+  candidate; unfixable finding honestly refused; unknown id -> ok:false.
+- apply_editing_settings(CONSERVATIVE, NEWS): 4 overlays -> 2, 4 transitions
+  stamped "cut", profile recorded.
+- build_report: real counts (clips/broll/user/images/subs/overlays/
+  transitions/format/low_confidence list).
+- Routes via Flask test_client (live server untouched): profiles/modes 200,
+  lock 200 + bad input 400, qc 200 (error counted), fix 200 then 422 on
+  unknown id, report 200, apply 200 + bad profile 400.
+- node --check passed on frontend/js/editing.js; all imports verified
+  against api.js / store.js / timeline.js exports.

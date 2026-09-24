@@ -83,12 +83,13 @@ export function renderTimeline() {
     d.textContent = fmtTime(t).slice(0, -2);
     ruler.appendChild(d);
   }
-  ruler.onmousedown = (e) => {
+  ruler.onpointerdown = (e) => {
+    e.preventDefault();
     const r = ruler.getBoundingClientRect();
     seekFromEvent(e, r);
     const mv = (ev) => seekFromEvent(ev, r);
-    const up = () => { removeEventListener("mousemove", mv); removeEventListener("mouseup", up); };
-    addEventListener("mousemove", mv); addEventListener("mouseup", up);
+    const up = () => { removeEventListener("pointermove", mv); removeEventListener("pointerup", up); };
+    addEventListener("pointermove", mv); addEventListener("pointerup", up);
   };
 
   const tracksEl = document.getElementById("tl-tracks");
@@ -99,11 +100,8 @@ export function renderTimeline() {
     row.dataset.track = tr.id;
     row.innerHTML = `<div class="track-label">${esc(tr.label)}</div><div class="track-lane" style="width:${laneW}px"></div>`;
     const lane = row.querySelector(".track-lane");
-    lane.onmousedown = (e) => {
-      if (e.target === lane) {
-        S.selection.clear(); renderTimeline();
-        window.dispatchEvent(new CustomEvent("selection"));
-      }
+    lane.onpointerdown = (e) => {
+      if (e.target === lane) startMarquee(e);
     };
     tracksEl.appendChild(row);
     renderClipsForTrack(tr, lane);
@@ -189,9 +187,70 @@ function renderClipsForTrack(tr, lane) {
       ${c.transitionIn && c.transitionIn.type === "dissolve" ? `<div class="trans-mark"></div>` : ""}
       <span class="clip-title">${esc(clipLabel(c))}</span>
       <div class="trim-l"></div><div class="trim-r"></div>`;
-    el.onmousedown = (e) => clipMouseDown(e, c, el);
+    el.onpointerdown = (e) => clipMouseDown(e, c, el);
     lane.appendChild(el);
   }
+}
+
+// ---------------- drag-marquee box selection ----------------
+// Dragging on empty lane background draws a selection box across all lanes.
+// Locked clips are never selected. A plain click (no drag) keeps the old
+// behavior: clear the selection.
+function startMarquee(e) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const startX = e.clientX, startY = e.clientY;
+  const tracksEl = document.getElementById("tl-tracks");
+  const box = document.createElement("div");
+  box.className = "tl-marquee";
+  box.style.display = "none";
+  tracksEl.appendChild(box);
+  let dragging = false;
+  const mv = (ev) => {
+    if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+    dragging = true;
+    const r = tracksEl.getBoundingClientRect();
+    const x1 = Math.min(startX, ev.clientX) - r.left;
+    const x2 = Math.max(startX, ev.clientX) - r.left;
+    const y1 = Math.min(startY, ev.clientY) - r.top;
+    const y2 = Math.max(startY, ev.clientY) - r.top;
+    box.style.display = "block";
+    box.style.left = x1 + "px"; box.style.top = y1 + "px";
+    box.style.width = Math.max(0, x2 - x1) + "px";
+    box.style.height = Math.max(0, y2 - y1) + "px";
+  };
+  const up = (ev) => {
+    removeEventListener("pointermove", mv); removeEventListener("pointerup", up);
+    box.remove();
+    if (!dragging) {
+      if (S.selection.size) { S.selection.clear(); paintSelection(); }
+      window.dispatchEvent(new CustomEvent("selection"));
+      return;
+    }
+    const mx1 = Math.min(startX, ev.clientX), mx2 = Math.max(startX, ev.clientX);
+    const my1 = Math.min(startY, ev.clientY), my2 = Math.max(startY, ev.clientY);
+    const ids = [];
+    for (const el of tracksEl.querySelectorAll(".clip")) {
+      const r = el.getBoundingClientRect();
+      if (r.left < mx2 && r.right > mx1 && r.top < my2 && r.bottom > my1) {
+        const c = findClip(el.dataset.id);
+        if (c && !c.locked) ids.push(el.dataset.id);
+      }
+    }
+    S.selection.clear();
+    ids.forEach((id) => S.selection.add(id));
+    paintSelection();
+    window.dispatchEvent(new CustomEvent("selection"));
+    if (ids.length) toast(`${ids.length} clip(s) selected`);
+  };
+  addEventListener("pointermove", mv); addEventListener("pointerup", up);
+}
+
+/** Toggle .selected classes in place (no DOM rebuild), so an in-progress
+ *  drag keeps its live element references. */
+function paintSelection() {
+  for (const el of document.querySelectorAll("#tl-tracks .clip"))
+    el.classList.toggle("selected", S.selection.has(el.dataset.id));
 }
 
 function findClip(id) {
@@ -204,64 +263,86 @@ function findClip(id) {
 function clipMouseDown(e, c, el) {
   if (e.button !== 0) return;
   e.stopPropagation();
+  e.preventDefault();
   const id = c.clipId || c.id;
+  // Locked clips can never be selected or moved (unlock via Editing drawer).
+  if (c.locked) { toast("Clip is locked 🔒 — unlock it in the Editing drawer", "bad"); return; }
   if (e.shiftKey) {
     S.selection.has(id) ? S.selection.delete(id) : S.selection.add(id);
   } else if (!S.selection.has(id)) {
     S.selection.clear(); S.selection.add(id);
   }
-  renderTimeline();
+  // NOTE: paintSelection (not renderTimeline) — a full re-render here would
+  // detach `el` and kill live drag feedback.
+  paintSelection();
   window.dispatchEvent(new CustomEvent("selection"));
-  if (c.locked) { toast("Clip is locked 🔒", "bad"); return; }
 
   const mode = e.target.classList.contains("trim-l") ? "trimL"
     : e.target.classList.contains("trim-r") ? "trimR" : "move";
   const startX = e.clientX;
-  const orig = JSON.parse(JSON.stringify(c));
+  // Move drags every selected unlocked clip together; trim affects only the
+  // grabbed clip.
+  const targets = mode === "move"
+    ? selectedClips().filter(x => !x.locked)
+    : [c];
+  const orig = new Map(targets.map(x => [x.clipId || x.id,
+    { start: x.start, end: x.end, srcStart: x.srcStart, srcEnd: x.srcEnd }]));
+  const els = new Map();
+  for (const x of targets) {
+    const xid = x.clipId || x.id;
+    els.set(xid, document.querySelector(`#tl-tracks .clip[data-id="${xid}"]`));
+  }
+  const o0 = orig.get(id);
   const snapPts = snapPoints(c);
   let pushedUndo = false, moved = false;
-  const undoLabel = mode === "move" ? "Move clip" : "Trim clip";
+  const undoLabel = mode === "move" ? "Move clip(s)" : "Trim clip";
 
   const mv = (ev) => {
     if (!pushedUndo) { pushUndo(undoLabel); pushedUndo = true; }
     moved = true;
     const dt = (ev.clientX - startX) / pxPerSec;
     if (mode === "move") {
-      let ns = Math.max(0, orig.start + dt);
-      ns = applySnap(ns, snapPts, orig);
-      const d = ns - c.start;
-      c.start = round2(ns); c.end = round2(orig.end + d);
+      let ns = Math.max(0, o0.start + dt);
+      ns = applySnap(ns, snapPts, c);
+      const d = ns - o0.start;
+      for (const x of targets) {
+        const o = orig.get(x.clipId || x.id);
+        x.start = round2(Math.max(0, o.start + d));
+        x.end = round2(Math.max(0.2, o.end + d));
+        positionEl(els.get(x.clipId || x.id), x);
+      }
     } else if (mode === "trimL") {
-      let ns = applySnap(Math.max(0, orig.start + dt), snapPts, orig);
-      ns = Math.min(ns, orig.end - 0.2);
-      const d = ns - orig.start;
+      let ns = applySnap(Math.max(0, o0.start + dt), snapPts, c);
+      ns = Math.min(ns, o0.end - 0.2);
+      const d = ns - o0.start;
       c.start = round2(ns);
       if (c.srcStart != null && (c.sourceType === "broll" || c.sourceType === "user_video")) {
-        c.srcStart = round2(Math.max(0, orig.srcStart + d * (orig.speed || 1)));
+        c.srcStart = round2(Math.max(0, o0.srcStart + d * (c.speed || 1)));
       }
     } else {
-      let ne = applySnap(orig.end + dt, snapPts, orig);
-      ne = Math.max(ne, orig.start + 0.2);
-      const d = ne - orig.end;
+      let ne = applySnap(o0.end + dt, snapPts, c);
+      ne = Math.max(ne, o0.start + 0.2);
+      const d = ne - o0.end;
       c.end = round2(ne);
       if (c.srcEnd != null && (c.sourceType === "broll" || c.sourceType === "user_video")) {
         const a = asset(c.assetId);
-        c.srcEnd = round2(Math.min(orig.srcEnd + d * (orig.speed || 1), a?.duration || Infinity));
+        c.srcEnd = round2(Math.min(o0.srcEnd + d * (c.speed || 1), a?.duration || Infinity));
       }
     }
     positionEl(el, c);
     updatePlayhead();
   };
   const up = () => {
-    removeEventListener("mousemove", mv); removeEventListener("mouseup", up);
+    removeEventListener("pointermove", mv); removeEventListener("pointerup", up);
     if (moved) { markDirty(); scheduleAutosave(); }
     renderTimeline();
     window.dispatchEvent(new CustomEvent("selection"));
   };
-  addEventListener("mousemove", mv); addEventListener("mouseup", up);
+  addEventListener("pointermove", mv); addEventListener("pointerup", up);
 }
 
 function positionEl(el, c) {
+  if (!el) return;
   el.style.left = (c.start * pxPerSec) + "px";
   el.style.width = Math.max(6, (c.end - c.start) * pxPerSec) + "px";
 }

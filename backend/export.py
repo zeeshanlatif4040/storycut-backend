@@ -135,6 +135,47 @@ def build_ass(sub_cues: list[dict], path: str, style: dict, W: int, H: int):
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
+# Transitions are strictly opt-in, short and subtle: no dissolve may exceed
+# this, in either the preview or the export.
+MAX_TRANSITION = 0.5
+
+
+def _tl_dur(clip: dict) -> float:
+    return float(clip.get("end", 0)) - float(clip.get("start", 0))
+
+
+def _transition_layout(clips: list[dict], disabled: bool = False) -> list[float]:
+    """Effective dissolve duration per clip (index 0 is always 0.0).
+
+    This is the single source of truth for transition timing; the frontend
+    preview implements the identical rule so both agree exactly:
+      td = min(requested, 0.5, output_dur_so_far / 2, clip_dur / 2)
+    Cuts, non-dissolve types, tiny durations (<=0.05s) and the global
+    transitionsDisabled flag all yield 0.0 (hard cut, no timeline shortening).
+    """
+    tds = [0.0]
+    if not clips:
+        return tds
+    acc_dur = _tl_dur(clips[0])
+    for i in range(1, len(clips)):
+        dur = _tl_dur(clips[i])
+        tr = (clips[i].get("transitionIn") or {})
+        td = 0.0
+        if not disabled and tr.get("type") == "dissolve":
+            td = min(float(tr.get("duration") or 0.5), MAX_TRANSITION,
+                     acc_dur / 2, dur / 2)
+            if td <= 0.05:
+                td = 0.0
+        tds.append(td)
+        acc_dur = acc_dur + dur - td
+    return tds
+
+
+def expected_output_duration(clips: list[dict], disabled: bool = False) -> float:
+    """What the export timeline will actually last (xfade shortens by td)."""
+    tds = _transition_layout(clips, disabled)
+    return sum(_tl_dur(c) for c in clips) - sum(tds)
+
 
 def _clip_is_still_image(clip: dict) -> bool:
     """True for still images regardless of source (user_image, broll image...).
@@ -201,7 +242,13 @@ def _clip_filter(clip: dict, W: int, H: int, fps: int, idx: int) -> tuple[str, s
     return f, label
 
 
-def _drawtext_filter(ov: dict, W: int, H: int) -> str:
+def _drawtext_filter(ov: dict, W: int, H: int, static: bool = False) -> str:
+    """drawtext chain for one overlay.
+
+    static=True renders the final resting state with no animation (global
+    "Disable all text animations"): full opacity, no slide-in offset, no
+    pop scaling, and stat counters show their settled value.
+    """
     raw_text = ov.get("text", "")
     t1, t2 = float(ov.get("start", 0)), float(ov.get("end", 1))
     style = ov.get("style", "fade")
@@ -210,14 +257,18 @@ def _drawtext_filter(ov: dict, W: int, H: int) -> str:
     font = FONT if os.path.exists(FONT) else None
     # animated counter for numeric stats: counts 1 -> target over the hold
     tval = _esc_drawtext(raw_text)
-    if ov.get("kind") == "stat":
-        m = re.fullmatch(r"\s*([\d,]+(?:\.\d+)?)\s*", raw_text)
-        if m:
-            try:
-                target = float(m.group(1).replace(",", ""))
-            except ValueError:
-                target = 0
-            if target > 1:
+    m = re.fullmatch(r"\s*([\d,]+(?:\.\d+)?)\s*", raw_text) if ov.get("kind") == "stat" else None
+    if m:
+        try:
+            target = float(m.group(1).replace(",", ""))
+        except ValueError:
+            target = 0
+        if target > 1:
+            if static:
+                # settled value, formatted exactly like the preview's final frame
+                done = f"{int(round(target)):,}" if target.is_integer() else f"{target:.1f}"
+                tval = _esc_drawtext(raw_text.replace(m.group(1), done, 1))
+            else:
                 c_dur = max(0.6, (t2 - t1) - 0.5)
                 fmt = "d" if target.is_integer() else ".1f"
                 expr = (f"if(lt(t-{t1:.3f},{c_dur:.3f}),"
@@ -226,21 +277,24 @@ def _drawtext_filter(ov: dict, W: int, H: int) -> str:
     base = f"drawtext={('fontfile=' + font + ':') if font else ''}text='{tval}'"
     base += f":fontsize={size}:fontcolor={color}"
     base += ":borderw=2:bordercolor=black@0.8"
-    x_expr, y_expr, a_expr = "(w-text_w)/2", f"h*0.78", None
+    x_expr, y_expr = "(w-text_w)/2", "h*0.78"
     if style == "lower-third":
-        x_expr, y_expr = "60", f"h*0.72"
+        x_expr, y_expr = "60", "h*0.72"
     elif style == "stat-pop":
         x_expr, y_expr = "(w-text_w)/2", "(h-text_h)/2"
-    fade = 0.4
-    a_in = f"if(lt(t,{t1}),0,if(lt(t,{t1}+{fade}),(t-{t1})/{fade},1))"
-    a_out = f"if(gt(t,{t2}),0,if(gt(t,{t2}-{fade}),({t2}-t)/{fade},1))"
-    a_expr = f"({a_in})*({a_out})"
-    if style == "slide":
-        y_expr = f"(h*0.78)+80*(1-({a_in}))"
-    if style == "stat-pop":
-        base = base.replace(f":fontsize={size}",
-                            f":fontsize='({size})*(0.6+0.4*({a_in}))'")
-    base += f":x='{x_expr}':y='{y_expr}':alpha='{a_expr}'"
+    if static:
+        base += f":x='{x_expr}':y='{y_expr}':alpha='1'"
+    else:
+        fade = 0.4
+        a_in = f"if(lt(t,{t1}),0,if(lt(t,{t1}+{fade}),(t-{t1})/{fade},1))"
+        a_out = f"if(gt(t,{t2}),0,if(gt(t,{t2}-{fade}),({t2}-t)/{fade},1))"
+        a_expr = f"({a_in})*({a_out})"
+        if style == "slide":
+            y_expr = f"(h*0.78)+80*(1-({a_in}))"
+        if style == "stat-pop":
+            base = base.replace(f":fontsize={size}",
+                                f":fontsize='({size})*(0.6+0.4*({a_in}))'")
+        base += f":x='{x_expr}':y='{y_expr}':alpha='{a_expr}'"
     base += f":enable='between(t,{t1},{t2})'"
     return base
 
@@ -307,14 +361,14 @@ def _run(job_id: str, timeline: dict, settings: dict):
         labels.append((label, clip))
 
     # chain: concat / xfade (normalize timebases first — xfade requires identical tb)
+    # Timing comes from _transition_layout so preview and export agree exactly.
+    tds = _transition_layout(clips, disabled=bool(timeline.get("transitionsDisabled")))
     acc = labels[0][0]
-    acc_dur = float(clips[0].get("end", 0)) - float(clips[0].get("start", 0))
+    acc_dur = _tl_dur(clips[0])
     for i in range(1, len(labels)):
         lab, clip = labels[i]
-        dur = float(clip.get("end", 0)) - float(clip.get("start", 0))
-        tr = (clip.get("transitionIn") or {})
-        ttype = tr.get("type", "cut")
-        td = min(float(tr.get("duration", 0.5)), acc_dur / 2, dur / 2)
+        dur = _tl_dur(clip)
+        td = tds[i]
         aN, bN, nxt = f"an{i}", f"bn{i}", f"acc{i}"
         # xfade/concat need identical CFR + pix fmt + timebase on both inputs.
         # Re-assert fps/format here: upstream chains (image loop/zoompan,
@@ -322,7 +376,7 @@ def _run(job_id: str, timeline: dict, settings: dict):
         # VFR stream, which fails filter config with "must be constant
         # frame rate". fps/format are idempotent, so double-apply is safe.
         filters.append(f"[{acc}]settb=AVTB[{aN}];[{lab}]settb=AVTB[{bN}]")
-        if ttype == "dissolve" and td > 0.05:
+        if td > 0:
             filters.append(
                 f"[{aN}][{bN}]xfade=transition=fade:duration={td:.3f}:"
                 f"offset={acc_dur - td:.3f}[{nxt}]")
@@ -336,11 +390,12 @@ def _run(job_id: str, timeline: dict, settings: dict):
     acc = acc + "f"
 
     # text overlays
+    static_text = bool(timeline.get("textAnimationsDisabled"))
     for ov in timeline.get("overlays", []):
         if ov.get("trackId", "gfx") != "gfx":
             continue
         nxt = acc + "t"
-        filters.append(f"[{acc}]{_drawtext_filter(ov, W, H)}[{nxt}]")
+        filters.append(f"[{acc}]{_drawtext_filter(ov, W, H, static=static_text)}[{nxt}]")
         acc = nxt
 
     # subtitles

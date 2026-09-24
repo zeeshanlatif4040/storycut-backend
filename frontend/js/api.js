@@ -33,8 +33,8 @@ export async function api(path, opts = {}) {
     throw unreachable();
   }
   const data = await readJson(res);
-  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
-  if (data && data.ok === false) throw new Error(data.error || "request failed");
+  if (!res.ok) throw new Error((data && (data.message || data.error)) || `HTTP ${res.status}`);
+  if (data && data.ok === false) throw new Error(data.message || data.error || "request failed");
   return data;
 }
 export const get = (p) => api(p);

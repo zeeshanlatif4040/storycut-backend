@@ -74,6 +74,8 @@ function payload() {
     timeline: {
       clips: T.clips, overlays: T.overlays, subtitles: T.subtitles,
       subtitleStyle: T.subtitleStyle, subtitlesEnabled: T.subtitlesEnabled,
+      transitionsDisabled: !!T.transitionsDisabled,
+      textAnimationsDisabled: !!T.textAnimationsDisabled,
       voicePath: T.voice?.name || null,
       musicPath: T.music?.name || null, musicEnabled: !!T.musicEnabled,
       ducking: T.ducking ?? 0.35,

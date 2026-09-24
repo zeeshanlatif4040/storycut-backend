@@ -267,9 +267,9 @@ function renderEffectsTab(body) {
   body.innerHTML = `
     <h4 class="sec">Selected: ${esc((c.title || c.clipId).slice(0, 28))}</h4>
     <div class="wz-field"><label>Transition in</label><select id="fx-tin">
-      ${["cut", "dissolve", "fade"].map(t => `<option value="${t}" ${c.transitionIn?.type === t ? "selected" : ""}>${t}</option>`).join("")}</select></div>
-    <div class="wz-field"><label>Transition duration (s)</label>
-      <input type="range" id="fx-tind" min="0" max="2" step="0.1" value="${c.transitionIn?.duration || 0}"></div>
+      ${["cut", "dissolve"].map(t => `<option value="${t}" ${c.transitionIn?.type === t ? "selected" : ""}>${t}</option>`).join("")}</select></div>
+    <div class="wz-field"><label>Transition duration (s) — short, max 0.5</label>
+      <input type="range" id="fx-tind" min="0" max="0.5" step="0.1" value="${Math.min(c.transitionIn?.duration || 0, 0.5)}"></div>
     <div class="wz-field"><label>Speed</label>
       <input type="range" id="fx-spd" min="25" max="200" value="${(c.speed || 1) * 100}">
       <div class="muted" style="font-size:11px" id="fx-spdv">${Math.round((c.speed || 1) * 100)}%</div></div>
@@ -294,7 +294,7 @@ function renderEffectsTab(body) {
     mutate("Effect", () => fn(e));
   const inp = (id, fn) => body.querySelector(id).oninput = (e) => { fn(e); markDirty(); };
   ch("#fx-tin", e => c.transitionIn = { type: e.target.value, duration: c.transitionIn?.duration || 0.5 });
-  inp("#fx-tind", e => c.transitionIn = { type: c.transitionIn?.type || "dissolve", duration: +e.target.value });
+  inp("#fx-tind", e => c.transitionIn = { type: c.transitionIn?.type || "dissolve", duration: Math.min(1, +e.target.value) });
   inp("#fx-spd", e => { c.speed = e.target.value / 100; body.querySelector("#fx-spdv").textContent = e.target.value + "%"; });
   inp("#fx-op", e => c.opacity = e.target.value / 100);
   ch("#fx-gs", e => f.grayscale = e.target.checked);

@@ -179,29 +179,28 @@ function renderFrame(t) {
 
   const main = activeAt(T.clips.filter(c => c.trackId === "v_main"), t);
 
-  // dissolve transition: composite previous clip underneath, current ramps in
-  const tr = main?.transitionIn;
-  const dissolving = tr?.type === "dissolve" && (t - main.start) < (tr.duration || 0.5);
-  if (dissolving) {
-    const d = tr.duration || 0.5;
-    const prev = [...T.clips].filter(c => c.trackId === "v_main" && c.end <= main.start + 0.01)
-      .sort((a, b) => b.end - a.end)[0];
-    if (prev) {
-      renderFrameBase(t, W, H, prev, 1);
-      renderFrameBase(t, W, H, main, smooth((t - main.start) / d));
-      drawOverlaysAndSubs(t, W, H);
-      updateInspectBadge(main, t);
-      return;
+  // Opt-in dissolve, placed exactly where the export's xfade sits: the last
+  // td seconds of the outgoing clip crossfade into the incoming clip's
+  // first td seconds (export offset = acc_dur - td). td uses the identical
+  // clamping rule as backend/export.py::_transition_layout, so the preview
+  // and the FFmpeg export agree frame-for-frame at every junction.
+  // Anything that is not a dissolve is a hard cut (same as the export).
+  let drewMain = false;
+  if (main) {
+    const mains = T.clips.filter(c => c.trackId === "v_main")
+      .sort((a, b) => a.start - b.start);
+    const next = mains[mains.indexOf(main) + 1];
+    const td = next ? transitionTd(mains, mains.indexOf(next), !!T.transitionsDisabled) : 0;
+    const remain = main.end - t;
+    if (next && td > 0 && remain > 0 && remain <= td) {
+      const q = td - remain;              // incoming clip's local time: 0..td
+      const a = smooth(q / td);
+      renderFrameBase(t, W, H, main, 1 - a);   // outgoing, true local time
+      renderFrameBase(t, W, H, next, a, q);    // incoming, local q (matches xfade)
+      drewMain = true;
     }
   }
-  drawMainClip(main, t, W, H, 1);
-  if (tr?.type === "fade") {
-    const d = tr.duration || 0.5;
-    if (t - main.start < d) {
-      ctx.fillStyle = `rgba(0,0,0,${1 - smooth((t - main.start) / d)})`;
-      ctx.fillRect(0, 0, W, H);
-    }
-  }
+  if (!drewMain) drawMainClip(main, t, W, H, 1);
 
   const ov = activeAt(T.clips.filter(c => c.trackId === "v_overlay"), t);
   if (ov) renderFrameBase(t, W, H, ov, ov.opacity ?? 0.9);
@@ -210,7 +209,7 @@ function renderFrame(t) {
   updateInspectBadge(main, t);
 }
 
-function renderFrameBase(t, W, H, clip, alpha) {
+function renderFrameBase(t, W, H, clip, alpha, localT) {
   if (!clip) return;
   if (clip.sourceType === "gap" || !clip.assetId) {
     ctx.save(); ctx.globalAlpha = alpha;
@@ -226,16 +225,19 @@ function renderFrameBase(t, W, H, clip, alpha) {
   ctx.save();
   ctx.globalAlpha = alpha * (clip.opacity ?? 1);
   applyFilter(clip);
-  if (a.kind === "image") drawKenBurns(a, clip, t, W, H);
-  else drawVideoFrame(a, clip, t, W, H);
+  // localT overrides the clip-local time (used to render the incoming clip
+  // of a dissolve at exactly the local time the export's xfade shows).
+  const lt = localT ?? (t - clip.start);
+  if (a.kind === "image") drawKenBurns(a, clip, lt, W, H);
+  else drawVideoFrame(a, clip, lt, W, H);
   ctx.restore();
 }
 
 function drawMainClip(clip, t, W, H, alpha) { renderFrameBase(t, W, H, clip, alpha); }
 
-function drawVideoFrame(a, clip, t, W, H) {
+function drawVideoFrame(a, clip, lt, W, H) {
   const v = videoFor(a.name);
-  const target = (clip.srcStart || 0) + (t - clip.start) * (clip.speed || 1);
+  const target = (clip.srcStart || 0) + lt * (clip.speed || 1);
   if (v.readyState >= 2) {
     if (Math.abs(v.currentTime - target) > 0.35) {
       try { v.currentTime = Math.min(target, (v.duration || target + 1) - 0.05); } catch {}
@@ -263,9 +265,9 @@ function thumbImage(thumb) {
   return thumbCache[thumb];
 }
 
-function drawKenBurns(a, clip, t, W, H) {
+function drawKenBurns(a, clip, lt, W, H) {
   const img = thumbImage(a.thumb || a.name);
-  const p = Math.min(1, Math.max(0, (t - clip.start) / Math.max(0.1, clip.end - clip.start)));
+  const p = Math.min(1, Math.max(0, lt / Math.max(0.1, clip.end - clip.start)));
   const draw = (iw, ih, src) => {
     const zoom = 1 + 0.14 * p;                       // subtle push-in
     const scale = Math.max(W / iw, H / ih) * zoom;
@@ -299,6 +301,27 @@ function applyFilter(clip) {
 
 function smooth(p) { p = Math.max(0, Math.min(1, p)); return p * p * (3 - 2 * p); }
 
+// Mirror of backend/export.py::_transition_layout — the clamping rules MUST
+// stay identical or the preview/export parity breaks.
+// td = min(requested, 0.5, output_dur_so_far / 2, clip_dur / 2); 0 for cuts,
+// non-dissolves, tiny durations, or when transitions are globally disabled.
+const MAX_TD = 0.5;
+function transitionTd(mains, idx, disabled) {
+  let acc = mains[0].end - mains[0].start;
+  for (let i = 1; i <= idx; i++) {
+    const d = mains[i].end - mains[i].start;
+    const tr = mains[i].transitionIn || {};
+    let td = 0;
+    if (!disabled && tr.type === "dissolve") {
+      td = Math.min(tr.duration || 0.5, MAX_TD, acc / 2, d / 2);
+      if (td <= 0.05) td = 0;
+    }
+    if (i === idx) return td;
+    acc = acc + d - td;
+  }
+  return 0;
+}
+
 // ---------------- text overlays + subtitles ----------------
 function drawOverlaysAndSubs(t, W, H) {
   const T = tl();
@@ -312,8 +335,11 @@ function drawOverlaysAndSubs(t, W, H) {
 }
 
 function drawTextOverlay(o, t, W, H) {
-  const p = smooth(Math.min(1, (t - o.start) / 0.45));
-  const pOut = smooth(Math.min(1, Math.max(0, (o.end - t) / 0.4)));
+  // Global "Disable all text animations": everything renders in its final
+  // resting state — full opacity, full text, settled counter value.
+  const noAnim = !!tl().textAnimationsDisabled;
+  const p = noAnim ? 1 : smooth(Math.min(1, (t - o.start) / 0.45));
+  const pOut = noAnim ? 1 : smooth(Math.min(1, Math.max(0, (o.end - t) / 0.4)));
   const alpha = Math.min(p, pOut);
   const size = Math.round((o.size || 56) * (W / 960));
   ctx.save();
@@ -325,7 +351,7 @@ function drawTextOverlay(o, t, W, H) {
 
   if (style === "lower-third") {
     align = "left"; x = W * 0.07; y = H * 0.74;
-    x = W * 0.07 - (1 - p) * 60;
+    x = W * 0.07 - (noAnim ? 0 : (1 - p) * 60);
     // backdrop bar
     ctx.fillStyle = "rgba(0,0,0,0.55)";
     const tw = ctx.measureText(text).width;
@@ -333,12 +359,13 @@ function drawTextOverlay(o, t, W, H) {
     ctx.fillStyle = "#6c8cff";
     ctx.fillRect(x - 18, y - size * 0.75, 6, size * 1.5);
   } else if (style === "slide") {
-    y = H * 0.78 + (1 - p) * 70;
+    y = H * 0.78 + (noAnim ? 0 : (1 - p) * 70);
   } else if (style === "stat-pop" || style === "pop") {
-    scale = 0.6 + 0.4 * p; y = H * 0.42;
-    if (o.kind === "stat" && /^\d/.test(text.trim())) text = animatedNumber(o, t);
+    scale = noAnim ? 1 : 0.6 + 0.4 * p; y = H * 0.42;
+    if (o.kind === "stat" && /^\d/.test(text.trim())) text = animatedNumber(o, t, noAnim);
   } else if (style === "type-on") {
-    text = text.slice(0, Math.floor(text.length * Math.min(1, (t - o.start) / 1.2)));
+    text = noAnim ? text
+      : text.slice(0, Math.floor(text.length * Math.min(1, (t - o.start) / 1.2)));
   }
   ctx.translate(x, y); ctx.scale(scale, scale);
   ctx.textAlign = align;
@@ -352,11 +379,11 @@ function drawTextOverlay(o, t, W, H) {
   ctx.restore();
 }
 
-function animatedNumber(o, t) {
+function animatedNumber(o, t, done) {
   const m = o.text.match(/[\d,.]+/);
   if (!m) return o.text;
   const target = parseFloat(m[0].replace(/,/g, ""));
-  const p = smooth(Math.min(1, (t - o.start) / 1.0));
+  const p = done ? 1 : smooth(Math.min(1, (t - o.start) / 1.0));
   const val = target * p;
   const fmt = m[0].includes(".") ? val.toFixed(1) : Math.round(val).toLocaleString();
   return o.text.replace(m[0], fmt);

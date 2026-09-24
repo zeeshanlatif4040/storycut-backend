@@ -44,6 +44,12 @@ export function emptyTimeline() {
       color: "#FFFFFF", outline: 2, background: "rgba(0,0,0,0.55)",
       position: "bottom", animation: "fade" },
     subtitlesEnabled: true,
+    // Global switches (user-facing toggles in the Editing drawer).
+    // transitionsDisabled: every junction renders as a hard cut (preview + export).
+    // textAnimationsDisabled: all text overlays/subtitles render static
+    //   (preview, subtitles, FFmpeg export, fast capture).
+    transitionsDisabled: false,
+    textAnimationsDisabled: false,
     voice: null, music: null, musicEnabled: false, ducking: 0.35,
     duration: 0,
   };

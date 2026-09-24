@@ -315,23 +315,13 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
 }
 
 function applyTransitions(P) {
+  // Transitions are strictly opt-in: every new segment defaults to a clean
+  // cut. The user adds dissolves deliberately via the Effects panel; the
+  // global "Disable all transitions" toggle forces cuts everywhere.
   const clips = P.timeline.clips.filter(c => c.trackId === "v_main");
-  for (let i = 1; i < clips.length; i++) {
-    const prev = clips[i - 1], cur = clips[i];
-    const a = new Set((prev.intent || "").split(" "));
-    const b = new Set((cur.intent || "").split(" "));
-    const inter = [...a].filter(x => b.has(x) && x).length;
-    const union = new Set([...a, ...b]).size || 1;
-    const topicShift = 1 - inter / union;
-    if (topicShift > 0.75) {
-      cur.transitionIn = { type: "dissolve", duration: 0.5 };   // scene change
-    } else {
-      cur.transitionIn = { type: "cut", duration: 0 };           // continuity: hard cut
-    }
-  }
-  if (clips.length) {
-    clips[0].transitionIn = { type: "fade", duration: 0.6 };
-    clips[clips.length - 1].transitionOut = { type: "fade", duration: 0.8 };
+  for (const c of clips) {
+    c.transitionIn = { type: "cut", duration: 0 };
+    c.transitionOut = { type: "cut", duration: 0 };
   }
 }
 

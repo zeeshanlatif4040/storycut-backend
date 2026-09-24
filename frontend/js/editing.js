@@ -137,6 +137,12 @@ function ensureDrawer() {
         <div id="ed-apply-msg" class="ed-empty"></div>
       </div>
       <div class="ed-sec"><h4>Scene locks</h4><div id="ed-scenes"></div></div>
+      <div class="ed-sec"><h4>Global switches</h4>
+        <label class="ed-row" style="cursor:pointer"><input type="checkbox" id="ed-no-trans">
+          <span>Disable all transitions <span class="ed-empty">(hard cuts in preview + export)</span></span></label>
+        <label class="ed-row" style="cursor:pointer"><input type="checkbox" id="ed-no-anim">
+          <span>Disable all text animations <span class="ed-empty">(static text in preview, subtitles, export)</span></span></label>
+      </div>
       <div class="ed-sec"><h4>Quality check</h4>
         <button class="btn sm" id="ed-qc">Run quality check</button>
         <div id="ed-qc-out" style="margin-top:8px"></div></div>
@@ -151,6 +157,20 @@ function ensureDrawer() {
   d.querySelector("#ed-source-mode").onchange = onSelectorChange;
   d.querySelector("#ed-creative-mode").onchange = onSelectorChange;
   d.querySelector("#ed-profile").onchange = onSelectorChange;
+  d.querySelector("#ed-no-trans").onchange = (e) => {
+    const T = S.project && S.project.timeline;
+    if (!T) return;
+    mutate("Disable all transitions", () => { T.transitionsDisabled = e.target.checked; });
+    toast(e.target.checked ? "All transitions disabled — hard cuts everywhere"
+                           : "Transitions re-enabled (opt-in dissolves still apply)");
+  };
+  d.querySelector("#ed-no-anim").onchange = (e) => {
+    const T = S.project && S.project.timeline;
+    if (!T) return;
+    mutate("Disable all text animations", () => { T.textAnimationsDisabled = e.target.checked; });
+    toast(e.target.checked ? "Text animations disabled — all text renders static"
+                           : "Text animations re-enabled");
+  };
 }
 
 function toggleDrawer(force) {
@@ -232,16 +252,21 @@ async function applySettings() {
     mutate("Apply style profile", () => {
       P.timeline.overlays = P.timeline.overlays
         .filter((o) => keep.has(`${o.start}|${o.end}|${o.text}`));
-      // Stamp default transitions onto clips still on hard cuts.
+      // Stamp default transitions onto clips still on hard cuts — unless the
+      // user globally disabled transitions (then everything stays a cut).
+      const noTrans = !!P.timeline.transitionsDisabled;
       const byIdx = {};
       for (const s of (qp.segments || [])) byIdx[s.index] = s.transition;
       const segIdx = {};
       for (const s of (P.plan.segments || [])) segIdx[s.id] = s.index;
       for (const c of P.timeline.clips) {
         const idx = segIdx[c.segmentId];
-        const tr = byIdx[idx];
-        if (tr && c.transitionIn && c.transitionIn.type === "cut") {
-          c.transitionIn = { type: tr, duration: tr === "cut" ? 0 : 0.6 };
+        let tr = byIdx[idx];
+        // Only "cut" and "dissolve" are real transitions (preview + export);
+        // exotic profile biases ("mixed", "whip") normalize to a subtle dissolve.
+        if (tr && tr !== "cut" && tr !== "dissolve") tr = "dissolve";
+        if (!noTrans && tr && c.transitionIn && c.transitionIn.type === "cut") {
+          c.transitionIn = { type: tr, duration: tr === "cut" ? 0 : 0.5 };
         }
       }
       P.editing = { ...ed, applied: (qp.editing || {}).applied || null };
@@ -478,6 +503,11 @@ function refresh() {
   if (!document.getElementById("editing-drawer")) return;
   fillSelectors();
   renderScenes();
+  const T = S.project && S.project.timeline;
+  if (T) {
+    document.getElementById("ed-no-trans").checked = !!T.transitionsDisabled;
+    document.getElementById("ed-no-anim").checked = !!T.textAnimationsDisabled;
+  }
 }
 
 async function init() {
