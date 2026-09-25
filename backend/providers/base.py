@@ -81,7 +81,7 @@ class BaseProvider:
 
     def search(self, query: str, orientation: str = "landscape",
                per_page: int = 12, page: int = 1,
-               media_type: str = "video") -> list[Candidate]:
+               media_type: str = "video", target_h: int = 1080) -> list[Candidate]:
         """Return ranked raw candidates for query. Raises on failure."""
         raise NotImplementedError
 
@@ -149,6 +149,24 @@ def classify_error(msg: str) -> str:
     return msg[:300]
 
 
+def pick_target(variants: list[tuple[int, int, str]],
+                target_h: int = 1080) -> tuple[int, int, str] | None:
+    """Pick the smallest variant with height >= target_h.
+
+    Smaller files download much faster; the caller chooses target_h based on
+    the desired download quality (e.g. 720 for fast, 1080 for full).
+    Falls back to the largest available variant when nothing reaches target_h.
+    Never invents a variant. Returns (width, height, url) or None.
+    """
+    vs = [(w, h, u) for w, h, u in variants if u and w > 0 and h > 0]
+    if not vs:
+        return None
+    at_or_above = sorted([v for v in vs if v[1] >= target_h], key=lambda v: v[1])
+    if at_or_above:
+        return at_or_above[0]
+    return sorted(vs, key=lambda v: -v[1])[0]
+
+
 def pick_1080p(variants: list[tuple[int, int, str]]) -> tuple[int, int, str] | None:
     """Pick the download variant closest to 1080p.
 
@@ -156,19 +174,7 @@ def pick_1080p(variants: list[tuple[int, int, str]]) -> tuple[int, int, str] | N
     nearest above 1080p -> anything available. Never invents a variant.
     Returns (width, height, url) or None.
     """
-    vs = [(w, h, u) for w, h, u in variants if u and w > 0 and h > 0]
-    if not vs:
-        return None
-    for w, h, u in vs:
-        if h == 1080:
-            return (w, h, u)
-    below = sorted([v for v in vs if 720 <= v[1] < 1080], key=lambda v: -v[1])
-    if below:
-        return below[0]
-    above = sorted([v for v in vs if v[1] > 1080], key=lambda v: v[1])
-    if above:
-        return above[0]
-    return sorted(vs, key=lambda v: -v[1])[0]
+    return pick_target(variants, 1080)
 
 
 def resolution_label(w: int, h: int) -> str:

@@ -40,8 +40,9 @@ export function initPreview() {
 function sizeCanvas() {
   const fmt = S.project?.format || "16:9";
   if (fmt === "9:16") { canvas.width = 540; canvas.height = 960; }
+  else if (fmt === "1:1") { canvas.width = 640; canvas.height = 640; }
   else { canvas.width = 960; canvas.height = 540; }
-  canvas.style.aspectRatio = fmt === "9:16" ? "9/16" : "16/9";
+  canvas.style.aspectRatio = fmt === "9:16" ? "9/16" : fmt === "1:1" ? "1/1" : "16/9";
 }
 
 function resetMedia() {

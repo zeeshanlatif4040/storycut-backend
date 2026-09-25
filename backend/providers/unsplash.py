@@ -69,7 +69,7 @@ class UnsplashProvider(BaseProvider):
 
     def search(self, query: str, orientation: str = "landscape",
                per_page: int = 12, page: int = 1,
-               media_type: str = "video") -> list[Candidate]:
+               media_type: str = "video", target_h: int = 1080) -> list[Candidate]:
         if media_type == "video":
             raise RuntimeError("Unsplash serves images only — no video API.")
         orient = {"landscape": "landscape", "portrait": "portrait",

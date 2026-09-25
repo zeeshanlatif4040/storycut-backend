@@ -61,9 +61,9 @@ def public_provider_settings() -> dict:
 
 # ----------------------------------------------------------------- cache
 def _cache_path(provider: str, query: str, orientation: str,
-                media_type: str = "video") -> str:
+                media_type: str = "video", target_h: int = 1080) -> str:
     h = hashlib.sha256(
-        f"{provider}|{query.lower().strip()}|{orientation}|{media_type}".encode()
+        f"{provider}|{query.lower().strip()}|{orientation}|{media_type}|{target_h}".encode()
     ).hexdigest()
     d = os.path.join(DIRS["cache"], provider)
     os.makedirs(d, exist_ok=True)
@@ -71,8 +71,8 @@ def _cache_path(provider: str, query: str, orientation: str,
 
 
 def cache_get(provider: str, query: str, orientation: str,
-              media_type: str = "video"):
-    p = _cache_path(provider, query, orientation, media_type)
+              media_type: str = "video", target_h: int = 1080):
+    p = _cache_path(provider, query, orientation, media_type, target_h)
     data = _read_json(p, None)
     if not data:
         return None, False
@@ -82,8 +82,8 @@ def cache_get(provider: str, query: str, orientation: str,
 
 
 def cache_put(provider: str, query: str, orientation: str, payload,
-              media_type: str = "video"):
-    p = _cache_path(provider, query, orientation, media_type)
+              media_type: str = "video", target_h: int = 1080):
+    p = _cache_path(provider, query, orientation, media_type, target_h)
     _write_json(p, {"ts": time.time(), "payload": payload})
 
 

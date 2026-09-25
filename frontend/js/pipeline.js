@@ -67,10 +67,36 @@ function scoreUserAsset(a, seg, orientation) {
   return { score: 0.6 * overlap + 0.2 * orientFit + 0.2 * durFit, overlap, orientFit, durFit };
 }
 
-function pickSrcStart(a, need) {
+const _scenesCache = {};
+async function ensureScenes(a) {
+  // Scene moments are computed on the server in the background after upload.
+  // If they are not on the asset yet, fetch them (cached per file). Falls
+  // back to the plain heuristic when the server cannot provide them in time.
+  if (a.kind !== "video" || !a.name) return a.scenes || [];
+  if (a.scenes && a.scenes.length) return a.scenes;
+  if (_scenesCache[a.name]) return _scenesCache[a.name];
+  const fetchP = (async () => {
+    // The server may still be analyzing in the background — poll briefly
+    // while it reports pending, then accept the heuristic fallback.
+    for (let i = 0; i < 6; i++) {
+      try {
+        const r = await get(`/api/media/scenes?name=${encodeURIComponent(a.name)}`);
+        if (r.scenes && r.scenes.length) { a.scenes = r.scenes; return r.scenes; }
+        if (!r.pending) return [];
+      } catch { return []; }
+      await new Promise(r => setTimeout(r, 5000));
+    }
+    return [];
+  })();
+  _scenesCache[a.name] = fetchP;
+  const timeoutP = new Promise(r => setTimeout(() => r([]), 45000));
+  return Promise.race([fetchP, timeoutP]);
+}
+
+async function pickSrcStart(a, need) {
   const dur = a.duration || need;
   if (a.kind === "image") return { srcStart: 0, srcEnd: need, speed: 1 };
-  const scenes = (a.scenes || []).filter(s => s >= 0.6 && s + need <= dur - 0.2);
+  const scenes = (await ensureScenes(a)).filter(s => s >= 0.6 && s + need <= dur - 0.2);
   if (scenes.length) return { srcStart: scenes[0], srcEnd: scenes[0] + need, speed: 1 };
   if (dur >= need) return { srcStart: Math.max(0, (dur - need) / 3), srcEnd: 0, speed: 1 };
   // source shorter than needed: gentle slow-motion to fill the narration
@@ -78,13 +104,14 @@ function pickSrcStart(a, need) {
 }
 
 // ---------------- B-roll search with provider fallback (spec 15) ----------------
-async function searchBroll(queries, orientation, need, usedIds, perPage, metrics, mediaType = "video") {
+async function searchBroll(queries, orientation, need, usedIds, perPage, metrics, mediaType = "video", targetH = 720) {
   for (const q of queries) {
     if (cancelled) return null;
     try {
       metrics.apiCalls++;
       const r = await get(`/api/broll/search?provider=auto&q=${encodeURIComponent(q)}` +
         `&orientation=${orientation}&per_page=${perPage}&media_type=${mediaType}` +
+        `&target_h=${targetH || 720}` +
         `&need_duration=${need.toFixed(1)}&used=${encodeURIComponent(usedIds.join(","))}`);
       metrics.searches++;
       if (r.cached) metrics.cacheHits++;
@@ -146,7 +173,7 @@ export async function runAutoEdit(cfg) {
     const segs = pr.plan.segments;
     const orientation = P.format === "9:16" ? "portrait" : "landscape";
     const perPage = cfg.speedMode === "fast" ? 6 : cfg.speedMode === "quality" ? 20 : 12;
-    const concurrency = cfg.speedMode === "fast" ? 5 : cfg.speedMode === "quality" ? 2 : 3;
+    const concurrency = cfg.speedMode === "fast" ? 5 : cfg.speedMode === "quality" ? 2 : 4;
     const queriesPerSeg = cfg.speedMode === "fast" ? 2 : 5;
     renderSceneCells(segs);
     const usedIds = [];
@@ -277,24 +304,33 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
 
   async function tryBroll() {
     if (mode === "user-only") return null;
-    for (let round = 1; round <= 3; round++) {
+    // Wizard options: auto-retry toggle controls how many search rounds run;
+    // footage-type toggle restricts the media searched.
+    const maxRounds = cfg.retryFailed === false ? 1 : 3;
+    const mp = cfg.mediaPref || "auto";
+    const doVideo = mp !== "image", doImage = mp !== "video";
+    for (let round = 1; round <= maxRounds; round++) {
       if (cancelled) return null;
       if (round > 1) {
         markScene(seg.id, "retry",
-          `No match — regenerating with broader search (attempt ${round}/3)…`);
+          `No match — regenerating with broader search (attempt ${round}/${maxRounds})…`);
         await sleep(1200); // gentle backoff; also lets rate-limit cooldowns breathe
       }
       const queries = relaxedQueries(round);
       const pp = Math.min(24, perPage + (round - 1) * 6);
       // The AI decides per scene: video first (motion usually wins), but images
       // compete whenever video is weak or missing — never force video.
-      const v = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "video");
-      const vScore = v && v.candidates.length ? v.candidates[0].score : 0;
-      let found = v, best = vScore + 0.05; // slight preference for motion
-      if (vScore < 0.45) {
-        const im = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "image");
+      // mediaPref "video"/"image" restricts the search to one media type.
+      let found = null, best = -1, vScore = -1;
+      if (doVideo) {
+        const v = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "video", cfg.targetH);
+        vScore = v && v.candidates.length ? v.candidates[0].score : 0;
+        if (v) { found = v; best = vScore + 0.05; } // slight preference for motion
+      }
+      if (doImage && vScore < 0.45) {
+        const im = await searchBroll(queries, orientation, need, usedIds, pp, metrics, "image", cfg.targetH);
         const iScore = im && im.candidates.length ? im.candidates[0].score : 0;
-        if (iScore > best) { found = im; best = iScore; }
+        if (im && iScore > best) { found = im; best = iScore; }
       }
       if (!found) continue;
       try {
@@ -340,31 +376,33 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
 
   if (!pick) {
     // No fresh visual after all retry rounds — fall back so the scene is
-    // NEVER left empty: reuse an already-downloaded asset, else generate a
-    // local title slate. A black gap is the absolute last resort only.
+    // NEVER left empty: reuse an already-downloaded asset, else (if the
+    // wizard's title-card toggle is on) generate a local title slate.
+    // A black gap is the absolute last resort only.
     const fb = fallbackAsset(seg, P, mode, usedIds);
     if (fb) {
-      return buildClipFromAsset(seg, orientation, need, fb.asset, {
+      return await buildClipFromAsset(seg, orientation, need, fb.asset, {
         score: 0.25, via: fb.via, confidence: "low",
         reviewReason: fb.reason, title: fb.title,
         searchQuery: "", matchInfo: { fallback: true },
       });
     }
-    try {
-      const asset = await slateAsset(seg, P, orientation);
-      return buildClipFromAsset(seg, orientation, need, asset, {
-        score: 0.2, via: "slate", confidence: "low",
-        reviewReason: "Generated title card — all providers failed after 3 search rounds",
-        title: `🖼️ ${((seg.keywords || []).slice(0, 3).join(" ") || "scene").slice(0, 34)}`,
-        searchQuery: "", matchInfo: { fallback: true, slate: true },
-      });
-    } catch (e) {
-      return gapClip(seg, "no B-roll results and no matching user media");
+    if (cfg.slateFallback !== false) {
+      try {
+        const asset = await slateAsset(seg, P, orientation);
+        return await buildClipFromAsset(seg, orientation, need, asset, {
+          score: 0.2, via: "slate", confidence: "low",
+          reviewReason: "Generated title card — all providers failed after 3 search rounds",
+          title: `🖼️ ${((seg.keywords || []).slice(0, 3).join(" ") || "scene").slice(0, 34)}`,
+          searchQuery: "", matchInfo: { fallback: true, slate: true },
+        });
+      } catch (e) { /* fall through to gap */ }
     }
+    return gapClip(seg, "no B-roll results and no matching user media");
   }
 
   const { asset } = pick;
-  return buildClipFromAsset(seg, orientation, need, asset, {
+  return await buildClipFromAsset(seg, orientation, need, asset, {
     score: pick.score, via,
     reviewReason: undefined, // auto: weak-match note when confidence is low
     searchQuery: pick.query || "",
@@ -373,8 +411,8 @@ async function buildSegmentVisual(seg, cfg, P, orientation, usedIds, perPage, nQ
 }
 
 // Build a timeline clip from any asset (fresh pick, reused fallback, or slate).
-function buildClipFromAsset(seg, orientation, need, asset, opts) {
-  const { srcStart, srcEnd: sEnd, speed } = pickSrcStart(asset, need);
+async function buildClipFromAsset(seg, orientation, need, asset, opts) {
+  const { srcStart, srcEnd: sEnd, speed } = await pickSrcStart(asset, need);
   const srcEnd = sEnd || (srcStart + need);
   const score = opts.score ?? 0.3;
   const confidence = opts.confidence ||
@@ -429,8 +467,9 @@ function fallbackAsset(seg, P, mode, usedIds) {
 // Fallback 2: generate a local cinematic title slate (gradient + scene
 // keywords) and upload it as an image asset — a designed card, never black.
 async function slateAsset(seg, P, orientation) {
-  const portrait = orientation === "portrait";
-  const W = portrait ? 720 : 1280, H = portrait ? 1280 : 720;
+  const fmt = P.format || "16:9";
+  const W = fmt === "9:16" ? 720 : fmt === "1:1" ? 1080 : 1280;
+  const H = fmt === "9:16" ? 1280 : fmt === "1:1" ? 1080 : 720;
   const cv = document.createElement("canvas");
   cv.width = W; cv.height = H;
   const x = cv.getContext("2d");

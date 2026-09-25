@@ -68,7 +68,7 @@ def _via_urllib(full_url: str, headers: dict, timeout: int):
 
 
 def api_get_json(url: str, params: dict | None = None,
-                 headers: dict | None = None, timeout: int = 25) -> dict:
+                 headers: dict | None = None, timeout: int = 15) -> dict:
     """GET ``url`` with browser fingerprint, return parsed JSON.
 
     Raises ProviderHttpError on HTTP >= 400, json errors propagate as-is.

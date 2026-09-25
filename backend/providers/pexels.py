@@ -6,7 +6,7 @@ Only documented endpoints and documented limits are used.
 from __future__ import annotations
 import time
 from .base import (BaseProvider, ProviderMeta, Candidate, orientation_of,
-                   pick_1080p, resolution_label)
+                   pick_target, resolution_label)
 from .http import api_get_json, ProviderHttpError
 
 META = ProviderMeta(
@@ -68,12 +68,12 @@ class PexelsProvider(BaseProvider):
     # ------------------------------------------------------------- search
     def search(self, query: str, orientation: str = "landscape",
                per_page: int = 12, page: int = 1,
-               media_type: str = "video") -> list[Candidate]:
+               media_type: str = "video", target_h: int = 1080) -> list[Candidate]:
         if media_type == "image":
             return self._search_images(query, orientation, per_page, page)
-        return self._search_videos(query, orientation, per_page, page)
+        return self._search_videos(query, orientation, per_page, page, target_h)
 
-    def _search_videos(self, query, orientation, per_page, page):
+    def _search_videos(self, query, orientation, per_page, page, target_h=1080):
         orient = {"landscape": "landscape", "portrait": "portrait"}.get(orientation, "")
         params = {"query": query, "per_page": max(1, min(80, per_page)), "page": page}
         if orient:
@@ -91,7 +91,7 @@ class PexelsProvider(BaseProvider):
                     if f.get("link"):
                         variants.append((f.get("width", 0) or 0,
                                          f.get("height", 0) or 0, f["link"]))
-            pick = pick_1080p(variants)
+            pick = pick_target(variants, target_h)
             if not pick:
                 continue
             w, h, link = pick

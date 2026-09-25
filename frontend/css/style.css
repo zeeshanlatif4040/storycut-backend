@@ -133,6 +133,9 @@ input[type=range]{accent-color:var(--acc)}
 .fmt-card.sel{border-color:var(--acc);box-shadow:var(--glow)}
 .fmt-prev{width:120px;height:68px;background:#0a0c12;border:1px solid var(--line2);margin:0 auto 10px;border-radius:8px}
 .fmt-prev.vert{width:44px;height:78px}
+.fmt-prev.sq{width:74px;height:74px}
+.chk{display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:13.5px}
+.chk input{margin-top:2px;accent-color:var(--acc)}
 .radio-row{display:flex;gap:8px;flex-wrap:wrap}
 .radio-pill{border:1px solid var(--line2);border-radius:22px;padding:8px 16px;cursor:pointer;
   font-size:13px;background:var(--bg3);transition:.13s}

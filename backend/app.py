@@ -157,6 +157,38 @@ def favicon():
 
 
 # ------------------------------------------------------------------ uploads
+# Scene-moment detection (full ffmpeg decode of the file) is the slowest part
+# of an upload — minutes for hundreds of MB on a small host. It must NOT run
+# synchronously inside /api/uploads, or the browser sits at "100% Uploading"
+# until the host kills the request and the files never register. Instead the
+# upload responds right after save+probe+thumbnail, and scene detection runs
+# in a background thread whose result is cached in a sidecar JSON file.
+_SCENES_JOBS: set[str] = set()
+_SCENES_LOCK = threading.Lock()
+
+
+def _scenes_sidecar(dest: str) -> str:
+    return dest + ".scenes.json"
+
+
+def _analyze_scenes_async(dest: str, name: str) -> None:
+    """Background scene detection; caches result next to the uploaded file."""
+    with _SCENES_LOCK:
+        _SCENES_JOBS.add(name)
+    try:
+        scenes = media_lib.scene_moments(dest)[:20]
+        try:
+            with open(_scenes_sidecar(dest), "w") as f:
+                json.dump(scenes, f)
+        except OSError:
+            pass
+    except Exception:
+        pass
+    finally:
+        with _SCENES_LOCK:
+            _SCENES_JOBS.discard(name)
+
+
 @app.post("/api/uploads")
 def uploads():
     """Multipart files -> validated storage + probe + thumbnail. kind=media|voice."""
@@ -199,7 +231,13 @@ def uploads():
             thumb = name + ".jpg"
             if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb)):
                 meta["thumb"] = thumb
-            meta["scenes"] = media_lib.scene_moments(dest)[:20]
+            # Scene detection is slow (full-file ffmpeg decode) — run it in the
+            # background so the upload response is fast. Frontend polls
+            # /api/media/scenes until the moments are ready.
+            meta["scenes"] = []
+            meta["scenesPending"] = True
+            threading.Thread(target=_analyze_scenes_async, args=(dest, name),
+                             daemon=True).start()
         elif meta["kind"] == "image":
             thumb = name + ".jpg"
             if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb), at=0):
@@ -218,6 +256,38 @@ def media_analyze():
         return err("file not found", 404)
     return jsonify({"ok": True, "scenes": media_lib.scene_moments(path),
                     "probe": media_lib.probe(path)})
+
+
+@app.get("/api/media/scenes")
+def media_scenes():
+    """Lightweight scene-moment lookup for an uploaded video.
+
+    Returns cached background-analysis results when ready, {"pending": true}
+    while the background job is still running, and falls back to a
+    synchronous computation (old behavior) if no job ever ran — e.g. the
+    host restarted mid-analysis."""
+    name = os.path.basename(request.args.get("name", ""))
+    path = store.safe_join(store.DIRS["uploads"], name)
+    if not os.path.exists(path):
+        return err("file not found", 404)
+    sidecar = _scenes_sidecar(path)
+    if os.path.exists(sidecar):
+        try:
+            with open(sidecar) as f:
+                return jsonify({"ok": True, "scenes": json.load(f), "pending": False})
+        except (OSError, ValueError):
+            pass
+    with _SCENES_LOCK:
+        running = name in _SCENES_JOBS
+    if running:
+        return jsonify({"ok": True, "scenes": [], "pending": True})
+    scenes = media_lib.scene_moments(path)[:20]
+    try:
+        with open(sidecar, "w") as f:
+            json.dump(scenes, f)
+    except OSError:
+        pass
+    return jsonify({"ok": True, "scenes": scenes, "pending": False})
 
 
 @app.get("/api/media/file")
@@ -316,6 +386,11 @@ def broll_search():
     if media_type not in ("video", "image"):
         media_type = "video"
     per_page = min(24, max(4, int(request.args.get("per_page", 12))))
+    try:
+        target_h = int(request.args.get("target_h", 1080))
+    except (TypeError, ValueError):
+        target_h = 1080
+    target_h = max(360, min(2160, target_h))
     need_duration = float(request.args.get("need_duration", 0) or 0)
     used_ids = request.args.get("used", "")
     used_ids = [u for u in used_ids.split(",") if u] if used_ids else []
@@ -339,7 +414,7 @@ def broll_search():
                              "result": f"does not serve {media_type}"})
             continue
         # cache first (stage 1 = metadata/thumbnails, never full downloads)
-        payload, hit = store.cache_get(key, query, orientation, media_type)
+        payload, hit = store.cache_get(key, query, orientation, media_type, target_h)
         if hit:
             store.log_event("search_cache_hit", provider=key, q=query)
             ranked = rank_candidates(payload, query, need_duration, used_ids, media_type)
@@ -351,10 +426,11 @@ def broll_search():
             adapter = registry.get_adapter(key, cfg.get("api_key", ""))
             t0 = time.time()
             cands = adapter.search(query, orientation=orientation,
-                                   per_page=per_page, media_type=media_type)
+                                   per_page=per_page, media_type=media_type,
+                                   target_h=target_h)
             ms = (time.time() - t0) * 1000
             payload = [asdict(c) for c in cands]
-            store.cache_put(key, query, orientation, payload, media_type)
+            store.cache_put(key, query, orientation, payload, media_type, target_h)
             store.log_event("search", provider=key, q=query, results=len(payload),
                             ms=round(ms))
             if payload:

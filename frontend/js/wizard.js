@@ -72,7 +72,8 @@ export function openWizard(mode) {
   newProject(mode);
   wiz = { mode, step: 0, script: "", voiceFiles: [], mediaFiles: [],
           format: "16:9", sourceMode: mode === "broll" ? "broll-first" : mode === "user" ? "user-first" : "balanced",
-          speedMode: "balanced" };
+          speedMode: "balanced", mediaPref: "auto", targetH: 720,
+          retryFailed: true, slateFallback: true };
   // Merge any files imported from Settings before the wizard was opened.
   for (const a of pendingImports) {
     if (!wiz.mediaFiles.some(m => m.name === a.name)) wiz.mediaFiles.push(a);
@@ -246,6 +247,9 @@ function renderMedia(body) {
       const pct = Math.round(frac * 100);
       fill.style.width = pct + "%";
       meta.textContent = `${pct}% — ${fmtMB(loaded)} of ${fmtMB(total)}`;
+      // Bytes are all sent at 100% but the server still has to respond —
+      // say so explicitly instead of looking stuck on "Uploading".
+      if (frac >= 0.999) label.textContent = "⏳ Upload complete — processing on server…";
     });
     bar.querySelector("#up-cancel").onclick = () => up.cancel();
     try {
@@ -259,6 +263,13 @@ function renderMedia(body) {
       bar.querySelector("#up-cancel").remove();
       toast(`${metas.length} file(s) analyzed`, "ok");
       setTimeout(() => { if (done) bar.innerHTML = ""; }, 4000);
+      // Scene-moment detection runs on the server in the background for
+      // videos (it needs a full decode). Poll until the moments land so the
+      // "AI picks the best moments" step has real data; export also
+      // lazy-fetches them if the user moves on faster than the analysis.
+      for (const m of metas) {
+        if (m.kind === "video" && m.scenesPending) pollScenes(m, body);
+      }
     } catch (e) {
       label.textContent = `❌ Upload failed — ${e.message}`;
       meta.innerHTML = `<button class="btn sm primary" id="up-retry">Retry</button>
@@ -270,12 +281,33 @@ function renderMedia(body) {
   }, "Videos (MP4/MOV/WebM/MKV) and images (JPG/PNG/WebP)");
   renderMediaChips(body);
 }
+/** Poll /api/media/scenes until background scene detection finishes for an
+ *  uploaded video, then refresh its chip. Non-blocking: the user can click
+ *  Next at any time — export lazy-fetches missing moments itself. */
+async function pollScenes(m, body) {
+  for (let i = 0; i < 60; i++) {           // up to ~5 minutes
+    await new Promise(r => setTimeout(r, 5000));
+    if (!wiz.mediaFiles.includes(m)) return;   // user removed the file
+    if (m.scenes && m.scenes.length) return;   // already filled
+    try {
+      const r = await get(`/api/media/scenes?name=${encodeURIComponent(m.name)}`);
+      if (r.scenes && r.scenes.length) {
+        m.scenes = r.scenes;
+        m.scenesPending = false;
+        renderMediaChips(body);
+        return;
+      }
+      if (!r.pending) { m.scenesPending = false; return; }
+    } catch { return; }   // server unreachable — export will retry lazily
+  }
+  m.scenesPending = false;
+}
 function renderMediaChips(body) {
   const chips = body.querySelector("#dz-chips");
   if (!chips) return;
   chips.innerHTML = wiz.mediaFiles.map((f, i) => `
     <div class="file-chip">${f.kind === "video" ? "🎞" : "🖼"} ${esc(f.original)}
-      ${f.duration ? `(${f.duration.toFixed(1)}s)` : ""}<button data-i="${i}">✕</button></div>`).join("");
+      ${f.duration ? `(${f.duration.toFixed(1)}s)` : ""}${f.kind === "video" && f.scenesPending && !(f.scenes && f.scenes.length) ? ` <span class="muted">· ⏳ moments…</span>` : ""}<button data-i="${i}">✕</button></div>`).join("");
   chips.querySelectorAll("button").forEach(b => b.onclick = (e) => {
     e.stopPropagation(); wiz.mediaFiles.splice(+b.dataset.i, 1); renderMediaChips(body);
   });
@@ -294,10 +326,27 @@ function renderFormat(body) {
           <div class="fmt-prev"></div><b>YouTube 16:9</b><div class="muted">Landscape</div></div>
         <div class="fmt-card ${wiz.format === "9:16" ? "sel" : ""}" data-fmt="9:16">
           <div class="fmt-prev vert"></div><b>YouTube Shorts 9:16</b><div class="muted">Vertical</div></div>
+        <div class="fmt-card ${wiz.format === "1:1" ? "sel" : ""}" data-fmt="1:1">
+          <div class="fmt-prev sq"></div><b>Square 1:1</b><div class="muted">Instagram / Facebook</div></div>
       </div></div>
     <div class="wz-field"><label>Visual source mode</label>
       <div class="radio-row">${modes.map(([v, l]) =>
         `<div class="radio-pill ${wiz.sourceMode === v ? "sel" : ""}" data-sm="${v}">${l}</div>`).join("")}</div></div>
+    <div class="wz-field"><label>Footage type</label>
+      <div class="radio-row">${[["auto", "✨ Auto (AI decides)"], ["video", "🎬 Videos only"], ["image", "🖼️ Images only"]].map(([v, l]) =>
+        `<div class="radio-pill ${wiz.mediaPref === v ? "sel" : ""}" data-mp="${v}">${l}</div>`).join("")}</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">Videos only = every scene gets motion footage. Images only = fast slideshow-style edits.</div></div>
+    <div class="wz-field"><label>Download quality</label>
+      <div class="radio-row">${[[720, "⚡ Fast (720p)"], [1080, "🎬 Full (1080p)"]].map(([v, l]) =>
+        `<div class="radio-pill ${wiz.targetH === v ? "sel" : ""}" data-th="${v}">${l}</div>`).join("")}</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">Fast downloads ~4x smaller files — much quicker B-roll. Full keeps maximum sharpness for 1080p+ exports.</div></div>
+    <div class="wz-field"><label>If a scene finds nothing</label>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:2px">
+        <label class="chk"><input type="checkbox" data-fb="retryFailed" ${wiz.retryFailed ? "checked" : ""}>
+          <span>🔁 Auto-retry failed scenes <span class="muted">— regenerate with broader searches (3 attempts)</span></span></label>
+        <label class="chk"><input type="checkbox" data-fb="slateFallback" ${wiz.slateFallback ? "checked" : ""}>
+          <span>🪄 Generate title card <span class="muted">— designed scene card instead of leaving a gap</span></span></label>
+      </div></div>
     <div class="wz-field"><label>Processing mode</label>
       <div class="radio-row">${[["fast", "⚡ Fast"], ["balanced", "⚖ Balanced"], ["quality", "💎 Quality"]].map(([v, l]) =>
         `<div class="radio-pill ${wiz.speedMode === v ? "sel" : ""}" data-pm="${v}">${l}</div>`).join("")}</div>
@@ -309,6 +358,17 @@ function renderFormat(body) {
   body.querySelectorAll("[data-sm]").forEach(c => c.onclick = () => {
     wiz.sourceMode = c.dataset.sm;
     body.querySelectorAll("[data-sm]").forEach(x => x.classList.toggle("sel", x === c));
+  });
+  body.querySelectorAll("[data-mp]").forEach(c => c.onclick = () => {
+    wiz.mediaPref = c.dataset.mp;
+    body.querySelectorAll("[data-mp]").forEach(x => x.classList.toggle("sel", x === c));
+  });
+  body.querySelectorAll("[data-th]").forEach(c => c.onclick = () => {
+    wiz.targetH = parseInt(c.dataset.th, 10);
+    body.querySelectorAll("[data-th]").forEach(x => x.classList.toggle("sel", x === c));
+  });
+  body.querySelectorAll("[data-fb]").forEach(c => c.onchange = () => {
+    wiz[c.dataset.fb] = c.checked;
   });
   body.querySelectorAll("[data-pm]").forEach(c => c.onclick = () => {
     wiz.speedMode = c.dataset.pm;
@@ -324,8 +384,12 @@ function renderReview(body) {
     <div class="kv"><span>Script</span><b>${words.toLocaleString()} words</b></div>
     <div class="kv"><span>Voice-over</span><b>${wiz.voiceFiles.length ? esc(wiz.voiceFiles[0].original) + ` (${wiz.voiceFiles[0].duration.toFixed(1)}s)` : "—"}</b></div>
     <div class="kv"><span>Your media</span><b>${wiz.mediaFiles.length} file(s)</b></div>
-    <div class="kv"><span>Format</span><b>${wiz.format}</b></div>
+    <div class="kv"><span>Format</span><b>${wiz.format}${wiz.format === "1:1" ? " (Square)" : ""}</b></div>
     <div class="kv"><span>Source mode</span><b>${esc(wiz.sourceMode)}</b></div>
+    <div class="kv"><span>Footage type</span><b>${wiz.mediaPref === "video" ? "🎬 Videos only" : wiz.mediaPref === "image" ? "🖼️ Images only" : "✨ Auto (AI decides)"}</b></div>
+    <div class="kv"><span>Download quality</span><b>${wiz.targetH === 1080 ? "🎬 Full (1080p)" : "⚡ Fast (720p)"}</b></div>
+    <div class="kv"><span>Auto-retry scenes</span><b>${wiz.retryFailed ? "🔁 On" : "Off"}</b></div>
+    <div class="kv"><span>Title-card fallback</span><b>${wiz.slateFallback ? "🪄 On" : "Off"}</b></div>
     <div class="kv"><span>Processing</span><b>${esc(wiz.speedMode)}</b></div>
     <p class="muted" style="font-size:12.5px">The AI will analyze the full script, map it to your voice-over's real timing,
     find/select visuals, trim and sync them, then build subtitles, text animations and a complete editable timeline.</p>`;
@@ -336,6 +400,9 @@ async function startEdit() {
   closeWizard();
   document.getElementById("startup").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
+  // Apply the chosen format BEFORE project-opened so the preview canvas
+  // sizes itself correctly on first paint (runAutoEdit sets it again later).
+  S.project.format = cfg.format;
   window.dispatchEvent(new CustomEvent("project-opened"));
   try {
     await runAutoEdit(cfg);
