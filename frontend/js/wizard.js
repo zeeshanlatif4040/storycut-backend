@@ -221,8 +221,15 @@ function fmtMB(b) {
 }
 
 function renderMedia(body) {
-  dropZone(body, "video/*,image/*", true, async (files) => {
-    if (!files.length) return;
+  dropZone(body, "video/*,image/*", true, (files) => {
+    if (files.length) startMediaUpload(body, files, false);
+  }, "Videos (MP4/MOV/WebM/MKV) and images (JPG/PNG/WebP)");
+  renderMediaChips(body);
+}
+/** Upload footage with the chunked resumable uploader. `isResume` only
+ *  changes the status-bar label — the uploader itself always resumes from
+ *  the server-confirmed bytes, so Retry never re-sends what arrived. */
+async function startMediaUpload(body, files, isResume) {
     // Persistent status bar: unlike the toast, this stays on screen for the
     // whole upload so a slow video upload never "disappears".
     let bar = body.querySelector("#media-up-status");
@@ -234,7 +241,7 @@ function renderMedia(body) {
     const names = files.map(f => f.name).join(", ");
     bar.innerHTML = `
       <div class="up-status">
-        <div class="up-row"><span class="up-label">⏳ Uploading: ${esc(names)}</span>
+        <div class="up-row"><span class="up-label">⏳ ${isResume ? "Resuming upload" : "Uploading"}: ${esc(names)}</span>
           <button class="btn sm" id="up-cancel">Cancel</button></div>
         <div class="up-track"><div class="up-fill" style="width:0%"></div></div>
         <div class="up-meta muted">0%</div>
@@ -246,9 +253,9 @@ function renderMedia(body) {
     const up = uploadFiles(files, "media", (frac, loaded, total) => {
       const pct = Math.round(frac * 100);
       fill.style.width = pct + "%";
-      meta.textContent = `${pct}% — ${fmtMB(loaded)} of ${fmtMB(total)}`;
-      // Bytes are all sent at 100% but the server still has to respond —
-      // say so explicitly instead of looking stuck on "Uploading".
+      meta.textContent = `${pct}% — ${fmtMB(loaded)} of ${fmtMB(total)} (server confirmed)`;
+      // All pieces sent at 100% but the server still finalizes — say so
+      // explicitly instead of looking stuck on "Uploading".
       if (frac >= 0.999) label.textContent = "⏳ Upload complete — processing on server…";
     });
     bar.querySelector("#up-cancel").onclick = () => up.cancel();
@@ -273,13 +280,12 @@ function renderMedia(body) {
     } catch (e) {
       label.textContent = `❌ Upload failed — ${e.message}`;
       meta.innerHTML = `<button class="btn sm primary" id="up-retry">Retry</button>
-        <span class="muted"> — tip: large videos upload faster on Wi-Fi; keep clips under ~200 MB on mobile data.</span>`;
+        <span class="muted"> — resumes from where it stopped, nothing re-uploads.</span>`;
       bar.querySelector("#up-cancel").remove();
       const rb = bar.querySelector("#up-retry");
-      if (rb) rb.onclick = () => { bar.innerHTML = ""; body.querySelector("#dz-input").click(); };
+      // Resume with the SAME files — the server kept every confirmed piece.
+      if (rb) rb.onclick = () => startMediaUpload(body, files, true);
     }
-  }, "Videos (MP4/MOV/WebM/MKV) and images (JPG/PNG/WebP)");
-  renderMediaChips(body);
 }
 /** Poll /api/media/scenes until background scene detection finishes for an
  *  uploaded video, then refresh its chip. Non-blocking: the user can click

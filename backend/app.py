@@ -189,63 +189,262 @@ def _analyze_scenes_async(dest: str, name: str) -> None:
             _SCENES_JOBS.discard(name)
 
 
-@app.post("/api/uploads")
-def uploads():
-    """Multipart files -> validated storage + probe + thumbnail. kind=media|voice."""
-    kind = request.form.get("kind", "media")
+def _finalize_upload(dest: str, filename: str, kind: str):
+    """Validate + probe + thumbnail a fully-received upload file.
+
+    Returns (meta, error). Scene detection for videos runs in the background
+    (see _analyze_scenes_async) so the response stays fast."""
+    ext = os.path.splitext(filename or "")[1].lower()
     allowed = (media_lib.ALLOWED_VIDEO | media_lib.ALLOWED_IMAGE
                if kind == "media" else media_lib.ALLOWED_AUDIO)
+    if ext not in allowed:
+        return None, f"File type not allowed: {filename}"
+    if os.path.getsize(dest) > media_lib.MAX_BYTES:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return None, f"File too large: {filename}"
+    info = media_lib.probe(dest)
+    meta = {"name": os.path.basename(dest), "original": filename,
+            "kind": media_lib.kind_of(ext),
+            "ext": ext, "size": os.path.getsize(dest),
+            "width": info["width"], "height": info["height"],
+            "duration": round(info["duration"], 2),
+            "orientation": ("portrait" if info["height"] > info["width"] * 1.05
+                            else "landscape" if info["width"] else "unknown")}
+    if kind == "voice":
+        # Real content validation (not just the extension). Rejects
+        # corrupt / non-audio files with a useful message and cleans up.
+        ok, emsg, ameta = media_lib.validate_audio(dest)
+        if not ok:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return None, (f"Audio upload failed — {emsg}. Please try again "
+                          f"with a valid file.")
+        meta["audio"] = ameta
+        store.log_event("voice_validated", name=meta["name"],
+                        duration=meta["duration"], **ameta)
+    if meta["kind"] == "video":
+        thumb = meta["name"] + ".jpg"
+        if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb)):
+            meta["thumb"] = thumb
+        # Scene detection is slow (full-file ffmpeg decode) — run it in the
+        # background so the upload response is fast. Frontend polls
+        # /api/media/scenes until the moments are ready.
+        meta["scenes"] = []
+        meta["scenesPending"] = True
+        threading.Thread(target=_analyze_scenes_async, args=(dest, meta["name"]),
+                         daemon=True).start()
+    elif meta["kind"] == "image":
+        thumb = meta["name"] + ".jpg"
+        if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb), at=0):
+            meta["thumb"] = thumb
+    store.log_event("upload", kind=meta["kind"], name=meta["name"],
+                    bytes=meta["size"])
+    return meta, ""
+
+
+@app.post("/api/uploads")
+def uploads():
+    """Multipart files -> validated storage + probe + thumbnail. kind=media|voice.
+
+    Single-request upload (kept for small files / compatibility). Large files
+    should use the chunked resumable flow (/api/uploads/init|chunk|complete)
+    so a dropped connection resumes instead of restarting from zero."""
+    kind = request.form.get("kind", "media")
     out = []
     for f in request.files.getlist("files"):
-        ext = os.path.splitext(f.filename or "")[1].lower()
-        if ext not in allowed:
-            return err(f"File type not allowed: {f.filename}")
         name = store.new_id("up") + "_" + media_lib.sanitize(f.filename)
         dest = store.safe_join(store.DIRS["uploads"], name)
         f.save(dest)
-        if os.path.getsize(dest) > media_lib.MAX_BYTES:
-            os.remove(dest)
-            return err(f"File too large: {f.filename}")
-        info = media_lib.probe(dest)
-        meta = {"name": name, "original": f.filename, "kind": media_lib.kind_of(ext),
-                "ext": ext, "size": os.path.getsize(dest),
-                "width": info["width"], "height": info["height"],
-                "duration": round(info["duration"], 2),
-                "orientation": ("portrait" if info["height"] > info["width"] * 1.05
-                                else "landscape" if info["width"] else "unknown")}
-        if kind == "voice":
-            # Real content validation (not just the extension). Rejects
-            # corrupt / non-audio files with a useful message and cleans up.
-            ok, emsg, ameta = media_lib.validate_audio(dest)
-            if not ok:
-                try:
-                    os.remove(dest)
-                except OSError:
-                    pass
-                return err(f"Audio upload failed — {emsg}. Please try again "
-                           f"with a valid file.", 400)
-            meta["audio"] = ameta
-            store.log_event("voice_validated", name=name,
-                            duration=meta["duration"], **ameta)
-        if meta["kind"] == "video":
-            thumb = name + ".jpg"
-            if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb)):
-                meta["thumb"] = thumb
-            # Scene detection is slow (full-file ffmpeg decode) — run it in the
-            # background so the upload response is fast. Frontend polls
-            # /api/media/scenes until the moments are ready.
-            meta["scenes"] = []
-            meta["scenesPending"] = True
-            threading.Thread(target=_analyze_scenes_async, args=(dest, name),
-                             daemon=True).start()
-        elif meta["kind"] == "image":
-            thumb = name + ".jpg"
-            if media_lib.make_thumbnail(dest, store.safe_join(store.DIRS["uploads"], thumb), at=0):
-                meta["thumb"] = thumb
-        store.log_event("upload", kind=meta["kind"], name=name,
-                        bytes=meta["size"])
+        meta, error = _finalize_upload(dest, f.filename, kind)
+        if error:
+            return err(error, 400)
         out.append(meta)
     return jsonify({"ok": True, "files": out})
+
+
+# ------------------------------------------------- chunked resumable uploads
+# Large uploads (hundreds of MB) die on flaky networks or host request
+# timeouts when sent as one giant POST. The chunked flow splits the file
+# into small pieces; the server records which pieces it already has, so a
+# retry resumes from the first missing piece instead of starting over.
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB — each request finishes in seconds
+_SESSION_TTL = 6 * 3600        # stale sessions swept after 6 hours
+
+
+def _session_dir() -> str:
+    d = os.path.join(store.DIRS["uploads"], ".sessions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _session_paths(upload_id: str):
+    base = _session_dir()
+    return (store.safe_join(base, upload_id + ".json"),
+            store.safe_join(base, upload_id + ".part"))
+
+
+def _load_session(upload_id: str):
+    if not upload_id or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", upload_id or ""):
+        return None
+    spath, _ = _session_paths(upload_id)
+    if not os.path.exists(spath):
+        return None
+    try:
+        with open(spath) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_session(upload_id: str, sess: dict) -> None:
+    spath, _ = _session_paths(upload_id)
+    sess["updated"] = time.time()
+    with open(spath, "w") as f:
+        json.dump(sess, f)
+
+
+def _sweep_sessions() -> None:
+    now = time.time()
+    try:
+        for fn in os.listdir(_session_dir()):
+            p = os.path.join(_session_dir(), fn)
+            try:
+                if now - os.path.getmtime(p) > _SESSION_TTL:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+@app.post("/api/uploads/init")
+def uploads_init():
+    """Start (or resume) a chunked upload session.
+
+    Body: {filename, size, kind, upload_id?}. If upload_id names a live
+    session for the same file, it is returned with its already-received
+    chunks so the client resumes instead of restarting. Otherwise a fresh
+    session is created. Returns {upload_id, chunk_size, total_chunks,
+    received: [indices the server already has]}."""
+    data = request.json or {}
+    filename = str(data.get("filename", ""))[:200]
+    size = data.get("size", 0)
+    kind = str(data.get("kind", "media"))
+    if kind not in ("media", "voice"):
+        return err("bad kind", 400)
+    if not isinstance(size, int) or size <= 0 or size > media_lib.MAX_BYTES:
+        return err("bad size", 400)
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = (media_lib.ALLOWED_VIDEO | media_lib.ALLOWED_IMAGE
+               if kind == "media" else media_lib.ALLOWED_AUDIO)
+    if ext not in allowed:
+        return err(f"File type not allowed: {filename}", 400)
+    _sweep_sessions()
+    resume_id = str(data.get("upload_id") or "")
+    if resume_id:
+        sess = _load_session(resume_id)
+        if (sess and sess.get("filename") == filename
+                and sess.get("size") == size and sess.get("kind") == kind):
+            return jsonify({"ok": True, "upload_id": resume_id,
+                            "chunk_size": sess["chunk_size"],
+                            "total_chunks": sess["total_chunks"],
+                            "received": sorted(sess["received"])})
+    upload_id = "up_" + store.new_id("s")
+    total_chunks = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    spath, ppath = _session_paths(upload_id)
+    # Pre-create the part file so chunks can be written at offsets.
+    with open(ppath, "wb") as f:
+        f.truncate(size)
+    sess = {"filename": filename, "size": size, "kind": kind,
+            "chunk_size": CHUNK_SIZE, "total_chunks": total_chunks,
+            "received": [], "created": time.time()}
+    _save_session(upload_id, sess)
+    return jsonify({"ok": True, "upload_id": upload_id,
+                    "chunk_size": CHUNK_SIZE, "total_chunks": total_chunks,
+                    "received": []})
+
+
+@app.get("/api/uploads/status")
+def uploads_status():
+    """Which chunks the server already has: {received: [...], received_bytes}."""
+    sess = _load_session(request.args.get("upload_id", ""))
+    if not sess:
+        return err("unknown or expired upload session", 404)
+    rec = sess["received"]
+    done = sum(min(sess["chunk_size"], sess["size"] - i * sess["chunk_size"])
+               for i in rec)
+    return jsonify({"ok": True, "received": sorted(rec),
+                    "received_bytes": done, "size": sess["size"],
+                    "total_chunks": sess["total_chunks"],
+                    "chunk_size": sess["chunk_size"]})
+
+
+@app.post("/api/uploads/chunk")
+def uploads_chunk():
+    """Receive one chunk: form fields upload_id + index, file field 'chunk'."""
+    upload_id = request.form.get("upload_id", "")
+    sess = _load_session(upload_id)
+    if not sess:
+        return err("unknown or expired upload session", 404)
+    try:
+        index = int(request.form.get("index", -1))
+    except (TypeError, ValueError):
+        return err("bad index", 400)
+    if not 0 <= index < sess["total_chunks"]:
+        return err("bad index", 400)
+    f = request.files.get("chunk")
+    if not f:
+        return err("missing chunk", 400)
+    data = f.read()
+    start = index * sess["chunk_size"]
+    expect = min(sess["chunk_size"], sess["size"] - start)
+    # Tolerate a short final chunk; reject anything wildly wrong.
+    if not 0 < len(data) <= expect + 1024:
+        return err("bad chunk size", 400)
+    _, ppath = _session_paths(upload_id)
+    with open(ppath, "r+b") as out:
+        out.seek(start)
+        out.write(data)
+    if index not in sess["received"]:
+        sess["received"].append(index)
+        _save_session(upload_id, sess)
+    rec = sess["received"]
+    done = sum(min(sess["chunk_size"], sess["size"] - i * sess["chunk_size"])
+               for i in rec)
+    return jsonify({"ok": True, "index": index, "received_bytes": done,
+                    "received_chunks": len(rec),
+                    "total_chunks": sess["total_chunks"]})
+
+
+@app.post("/api/uploads/complete")
+def uploads_complete():
+    """All chunks received -> finalize exactly like a normal upload."""
+    upload_id = (request.json or {}).get("upload_id", "")
+    sess = _load_session(upload_id)
+    if not sess:
+        return err("unknown or expired upload session", 404)
+    if len(sess["received"]) != sess["total_chunks"]:
+        return err(f"incomplete upload: {len(sess['received'])}/"
+                   f"{sess['total_chunks']} chunks received", 400)
+    spath, ppath = _session_paths(upload_id)
+    if not os.path.exists(ppath) or os.path.getsize(ppath) != sess["size"]:
+        return err("uploaded data corrupted — please retry the upload", 400)
+    name = store.new_id("up") + "_" + media_lib.sanitize(sess["filename"])
+    dest = store.safe_join(store.DIRS["uploads"], name)
+    os.replace(ppath, dest)
+    try:
+        os.remove(spath)
+    except OSError:
+        pass
+    meta, error = _finalize_upload(dest, sess["filename"], sess["kind"])
+    if error:
+        return err(error, 400)
+    return jsonify({"ok": True, "files": [meta]})
 
 
 @app.post("/api/media/analyze")
